@@ -5,7 +5,7 @@ import {randomUUID} from 'node:crypto';
 import {storageSecurity} from './private-storage.mjs';
 
 export function appDataRoot({platform=process.platform,env=process.env,home=os.homedir()}={}){
-  const paths=platform==='win32'?path.win32:path;
+  const paths=platform==='win32'?path.win32:path.posix;
   return paths.resolve(env.WHALE_PET_DATA_DIR||(platform==='win32'?paths.join(env.LOCALAPPDATA||paths.join(home,'AppData','Local'),'WhalePet'):paths.join(home,'Library','Application Support','WhalePet')));
 }
 export const fail=code=>Object.assign(new Error(code),{code});

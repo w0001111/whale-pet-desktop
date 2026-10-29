@@ -1,12 +1,27 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 import {execFile} from 'node:child_process';
-export function executePrivateCommand(file,args,options){
-  return new Promise((resolve,reject)=>{
-    const child=execFile(file,args,options,(error,stdout,stderr)=>error?reject(error):resolve({stdout,stderr}));
+export async function preparePrivateCommand(options={}){
+  const{isolatedProfile,...actual}=options;
+  if(!isolatedProfile)return{options:actual,cleanup:async()=>{}};
+  // PowerShell can create AppData caches even with -NoProfile. Never use the
+  // protected target/data directory as its profile, or the real user's profile.
+  const profile=await fs.mkdtemp(path.join(os.tmpdir(),'whale-acl-profile-'));
+  try{
+    const roaming=path.join(profile,'AppData','Roaming'),local=path.join(profile,'AppData','Local'),temporary=path.join(profile,'tmp');
+    for(const folder of[roaming,local,temporary])await fs.mkdir(folder,{recursive:true,mode:0o700});
+    actual.env={...actual.env,HOME:profile,USERPROFILE:profile,APPDATA:roaming,LOCALAPPDATA:local,TEMP:temporary,TMP:temporary};
+    return{options:actual,cleanup:()=>fs.rm(profile,{recursive:true,force:true,maxRetries:3,retryDelay:50})};
+  }catch(error){await fs.rm(profile,{recursive:true,force:true}).catch(()=>{});throw error;}
+}
+export async function executePrivateCommand(file,args,options){
+  const prepared=await preparePrivateCommand(options);
+  try{return await new Promise((resolve,reject)=>{
+    const child=execFile(file,args,prepared.options,(error,stdout,stderr)=>error?reject(error):resolve({stdout,stderr}));
     // PowerShell must never wait for an inherited/open parent input pipe.
     child.stdin?.on('error',()=>{});child.stdin?.end();
-  });
+  });}finally{await prepared.cleanup();}
 }
 const execute=executePrivateCommand;
 const fail=()=>Object.assign(new Error('UNSAFE_STORAGE'),{code:'UNSAFE_STORAGE'});
@@ -22,8 +37,7 @@ export function windowsAclCommand(target,isDirectory,{env=process.env}={}){
   // This executable is Windows PowerShell 5.1/.NET Framework: use its direct
   // filesystem ACL API, with no command-provider/module auto-loading required.
   const script=`$ErrorActionPreference='Stop';try{$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'));if(([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'reparse point'};$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18');$a=[Security.AccessControl.${isDirectory?'DirectorySecurity':'FileSecurity'}]::new();$a.SetAccessRuleProtection($true,$false);foreach($s in @($sid,$system)){$r=[Security.AccessControl.FileSystemAccessRule]::new($s,[Security.AccessControl.FileSystemRights]::FullControl,${isDirectory?'([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit)':'[Security.AccessControl.InheritanceFlags]::None'},[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow);$a.AddAccessRule($r)};[IO.${isDirectory?'Directory':'File'}]::SetAccessControl($p,$a);exit 0}catch{[Console]::Error.WriteLine('PRIVATE_ACL_FAILED');exit 1}`;
-  const profile=isDirectory?target:path.win32.dirname(target);
-  const options={windowsHide:true,timeout:15000,maxBuffer:4096,env:{SystemRoot:systemRoot,WINDIR:systemRoot,PATH:path.win32.join(systemRoot,'System32'),COMSPEC:path.win32.join(systemRoot,'System32','cmd.exe'),PATHEXT:'.COM;.EXE;.BAT;.CMD',PSModulePath:path.win32.join(systemRoot,'System32','WindowsPowerShell','v1.0','Modules'),HOME:profile,USERPROFILE:profile,APPDATA:profile,LOCALAPPDATA:profile,...(env.TEMP?{TEMP:env.TEMP}:{}),...(env.TMP?{TMP:env.TMP}:{})}};
+  const options={isolatedProfile:true,windowsHide:true,timeout:15000,maxBuffer:4096,env:{SystemRoot:systemRoot,WINDIR:systemRoot,PATH:path.win32.join(systemRoot,'System32'),COMSPEC:path.win32.join(systemRoot,'System32','cmd.exe'),PATHEXT:'.COM;.EXE;.BAT;.CMD',PSModulePath:path.win32.join(systemRoot,'System32','WindowsPowerShell','v1.0','Modules'),...(env.TEMP?{TEMP:env.TEMP}:{}),...(env.TMP?{TMP:env.TMP}:{})}};
   return{file:path.win32.join(systemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe'),args:['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],options};
 }
 

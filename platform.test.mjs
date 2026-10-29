@@ -7,7 +7,7 @@ import {spawn} from 'node:child_process';
 import {PassThrough} from 'node:stream';
 import {appDataRoot,privateRead,privateWrite} from './provider-config.mjs';
 import {findCodexBinary,createCodexEnvironment,sameCodexHome} from './codex-provider.mjs';
-import {createStorageSecurity,windowsAclCommand,executePrivateCommand} from './private-storage.mjs';
+import {createStorageSecurity,windowsAclCommand,executePrivateCommand,preparePrivateCommand} from './private-storage.mjs';
 import {attachParentIpc} from './service.mjs';
 import {assertPrivateFile,directoryLink} from './test/platform.mjs';
 
@@ -42,11 +42,22 @@ test('private ACL invocation is literal, no-profile, bounded and grants only cur
   assert.equal(script.includes(target),false);assert.ok(script.includes(Buffer.from(target).toString('base64')));
   assert.ok(command.args.includes('-NoProfile'));assert.ok(!command.args.includes('-ExecutionPolicy'));assert.equal(command.options.windowsHide,true);assert.equal(command.options.timeout,15000);assert.equal(command.options.env.OPENAI_API_KEY,undefined);
   assert.match(script,/\[IO\.Directory\]::SetAccessControl/);assert.equal(script.includes('Get-Item'),false);assert.equal(script.includes('Set-Acl'),false);assert.match(script,/exit 0/);
-  assert.equal(command.options.env.USERPROFILE,target);assert.ok(command.options.env.PSModulePath.endsWith('WindowsPowerShell\\v1.0\\Modules'));
+  assert.equal(command.options.env.USERPROFILE,undefined);assert.equal(command.options.isolatedProfile,true);assert.ok(command.options.env.PSModulePath.endsWith('WindowsPowerShell\\v1.0\\Modules'));
 });
 test('private helper closes stdin rather than leaving a child waiting on the parent input pipe',async()=>{
   const {stdout}=await executePrivateCommand(process.execPath,['-e','process.stdin.resume();process.stdin.once("end",()=>process.stdout.write("SYNTHETIC-EOF"));'],{timeout:2000,windowsHide:true});
   assert.equal(stdout,'SYNTHETIC-EOF');
+});
+test('ACL helper profile is an ephemeral separate home, removed after success or child failure',async()=>{
+  const prepared=await preparePrivateCommand({isolatedProfile:true,env:{SYNTHETIC_SETTING:'1'}});
+  const profile=prepared.options.env.USERPROFILE;
+  assert.ok(profile.startsWith(os.tmpdir()));assert.notEqual(prepared.options.env.APPDATA,profile);assert.equal(prepared.options.isolatedProfile,undefined);
+  await fs.writeFile(path.join(prepared.options.env.LOCALAPPDATA,'SYNTHETIC-CACHE'),'cache');await prepared.cleanup();await assert.rejects(fs.stat(profile),{code:'ENOENT'});
+  let childProfile;
+  const script='process.stdout.write(process.env.USERPROFILE);';
+  childProfile=(await executePrivateCommand(process.execPath,['-e',script],{isolatedProfile:true,timeout:2000,env:{}})).stdout;
+  await assert.rejects(fs.stat(childProfile),{code:'ENOENT'});
+  await assert.rejects(executePrivateCommand(process.execPath,['-e','process.exit(2)'],{isolatedProfile:true,timeout:2000,env:{}}),error=>error.code===2);
 });
 test('Windows private storage applies ACL only to app data, caches secured identities and never uses O_NOFOLLOW',async t=>{
   const root=await temporary(t),directory=path.join(root,'data'),calls=[],flags=[];
