@@ -4,11 +4,6 @@ on:
     branches: [windows-port]
     paths-ignore: ['**.md']
   workflow_dispatch:
-    inputs:
-      stage_release:
-        description: 'Upload validated assets to a draft Windows test release'
-        type: boolean
-        default: false
 permissions:
   contents: read
 concurrency:
@@ -18,8 +13,6 @@ jobs:
   windows:
     runs-on: windows-2025
     timeout-minutes: 40
-    permissions:
-      contents: write
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       DOTNET_NOLOGO: '1'
@@ -29,13 +22,19 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: Install pinned Microsoft SDK
         uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: '10.0.403'
       - name: Verify official runtime archives
         run: python scripts/fetch-windows-runtime.py --include-installer
+      - name: Verify Windows private storage before running regressions
+        timeout-minutes: 2
+        run: '& .cache/windows-runtime/x64/bin/node.exe scripts/windows-acl-preflight.mjs'
       - name: Run shared backend regressions on Windows
+        timeout-minutes: 12
         run: python scripts/run-windows-backend-tests.py
       - name: Build native application, portable ZIP and installer
         run: python scripts/package-windows.py
@@ -61,20 +60,3 @@ jobs:
           compression-level: 0
           retention-days: 14
           if-no-files-found: error
-      - name: Stage validated public release assets as a draft
-        if: github.event_name == 'workflow_dispatch' && inputs.stage_release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          $tag = 'v0.2.0-windows.1'
-          $draft = gh release view $tag --json isDraft --jq '.isDraft' 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --draft --prerelease --target $env:GITHUB_SHA --title 'Whale Pet 0.2.0 Windows 测试版' --notes-file docs/RELEASE.windows.md
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          } elseif ($draft -ne 'true') {
-            throw 'Refusing to replace assets of an already published release.'
-          }
-          $files = Get-ChildItem 'dist/windows' -File | ForEach-Object { $_.FullName }
-          gh release upload $tag @files --clobber
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

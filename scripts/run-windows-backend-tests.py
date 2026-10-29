@@ -56,7 +56,7 @@ def main():
         report['testFiles'] = len(tests)
         with tempfile.TemporaryDirectory(prefix='whale-backend-ci-') as raw:
             env = test_environment(Path(raw))
-            child = subprocess.Popen([str(node), '--test', '--test-reporter=tap',
+            child = subprocess.Popen([str(node), '--test', '--test-timeout=120000', '--test-reporter=tap',
                                       *(file.name for file in tests)], cwd=ROOT, env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, encoding='utf-8', errors='replace', bufsize=1)

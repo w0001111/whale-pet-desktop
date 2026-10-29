@@ -1,9 +1,14 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {execFile} from 'node:child_process';
-import {promisify} from 'node:util';
-
-const execute=promisify(execFile);
+export function executePrivateCommand(file,args,options){
+  return new Promise((resolve,reject)=>{
+    const child=execFile(file,args,options,(error,stdout,stderr)=>error?reject(error):resolve({stdout,stderr}));
+    // PowerShell must never wait for an inherited/open parent input pipe.
+    child.stdin?.on('error',()=>{});child.stdin?.end();
+  });
+}
+const execute=executePrivateCommand;
 const fail=()=>Object.assign(new Error('UNSAFE_STORAGE'),{code:'UNSAFE_STORAGE'});
 const identity=info=>`${info.dev}:${info.ino}`;
 const regular=info=>info.isFile()&&!info.isSymbolicLink()&&info.nlink===1n;
@@ -14,8 +19,12 @@ const regular=info=>info.isFile()&&!info.isSymbolicLink()&&info.nlink===1n;
 export function windowsAclCommand(target,isDirectory,{env=process.env}={}){
   const systemRoot=env.SystemRoot||env.SYSTEMROOT||env.WINDIR||'C:\\Windows';
   const encoded=Buffer.from(target,'utf8').toString('base64');
-  const script=`$ErrorActionPreference='Stop';$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'));$i=Get-Item -LiteralPath $p -Force;if(($i.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'reparse point'};$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18');$a=[Security.AccessControl.${isDirectory?'DirectorySecurity':'FileSecurity'}]::new();$a.SetAccessRuleProtection($true,$false);foreach($s in @($sid,$system)){$r=[Security.AccessControl.FileSystemAccessRule]::new($s,[Security.AccessControl.FileSystemRights]::FullControl,${isDirectory?'([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit)':'[Security.AccessControl.InheritanceFlags]::None'},[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow);$a.AddAccessRule($r)};Set-Acl -LiteralPath $p -AclObject $a`;
-  return{file:path.win32.join(systemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe'),args:['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],options:{windowsHide:true,timeout:15000,maxBuffer:4096,env:{SystemRoot:systemRoot,WINDIR:systemRoot,PATH:path.win32.join(systemRoot,'System32'),...(env.TEMP?{TEMP:env.TEMP}:{}),...(env.TMP?{TMP:env.TMP}:{})}}};
+  // This executable is Windows PowerShell 5.1/.NET Framework: use its direct
+  // filesystem ACL API, with no command-provider/module auto-loading required.
+  const script=`$ErrorActionPreference='Stop';try{$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'));if(([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'reparse point'};$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18');$a=[Security.AccessControl.${isDirectory?'DirectorySecurity':'FileSecurity'}]::new();$a.SetAccessRuleProtection($true,$false);foreach($s in @($sid,$system)){$r=[Security.AccessControl.FileSystemAccessRule]::new($s,[Security.AccessControl.FileSystemRights]::FullControl,${isDirectory?'([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit)':'[Security.AccessControl.InheritanceFlags]::None'},[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow);$a.AddAccessRule($r)};[IO.${isDirectory?'Directory':'File'}]::SetAccessControl($p,$a);exit 0}catch{[Console]::Error.WriteLine('PRIVATE_ACL_FAILED');exit 1}`;
+  const profile=isDirectory?target:path.win32.dirname(target);
+  const options={windowsHide:true,timeout:15000,maxBuffer:4096,env:{SystemRoot:systemRoot,WINDIR:systemRoot,PATH:path.win32.join(systemRoot,'System32'),COMSPEC:path.win32.join(systemRoot,'System32','cmd.exe'),PATHEXT:'.COM;.EXE;.BAT;.CMD',PSModulePath:path.win32.join(systemRoot,'System32','WindowsPowerShell','v1.0','Modules'),HOME:profile,USERPROFILE:profile,APPDATA:profile,LOCALAPPDATA:profile,...(env.TEMP?{TEMP:env.TEMP}:{}),...(env.TMP?{TMP:env.TMP}:{})}};
+  return{file:path.win32.join(systemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe'),args:['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],options};
 }
 
 export function createStorageSecurity({platform=process.platform,io=fs,executeImpl=execute,env=process.env}={}){

@@ -1,0 +1,31 @@
+name: Stage an already validated Windows build
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Successful Windows build run ID to stage without rebuilding'
+        required: true
+        type: string
+permissions:
+  actions: read
+  contents: write
+concurrency:
+  group: stage-windows-v0.2.0-windows.1
+  cancel-in-progress: false
+jobs:
+  stage:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: main
+      - name: Verify completed build and stage its exact artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VALIDATED_RUN_ID: ${{ inputs.run_id }}
+        run: python3 scripts/stage-windows-release.py
