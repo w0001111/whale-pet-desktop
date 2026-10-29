@@ -43,9 +43,22 @@ export function sameCodexHome(left,right,{platform=process.platform}={}){
   if(platform==='win32')return path.win32.resolve(left.replace(/^\\\\\?\\/,'' )).toLowerCase()===path.win32.resolve(right.replace(/^\\\\\?\\/,'')).toLowerCase();
   return path.resolve(left)===path.resolve(right);
 }
+export function codexRestrictionChecks({initialized,effective,home,canonicalHome,platform=process.platform}={}){
+  const config=effective?.config,version=initialized?.userAgent?.match(/\/(\d+\.\d+\.\d+)/)?.[1];
+  return{
+    versionPinned:/^0\.164\.\d+$/.test(version||''),
+    isolatedHome:sameCodexHome(initialized?.codexHome,home,{platform})||(typeof canonicalHome==='string'&&sameCodexHome(initialized?.codexHome,canonicalHome,{platform})),
+    shellDisabled:config?.features?.shell_tool===false,
+    featuresDisabled:['apps','multi_agent','browser_use','computer_use','remote_plugin','tool_suggest'].every(key=>config?.features?.[key]===false),
+    webSearchDisabled:config?.web_search==='disabled',projectDocsDisabled:config?.project_doc_max_bytes===0,
+    noMcpServers:!!config&&Object.keys(config.mcp_servers||{}).length===0,
+    readOnlySandbox:config?.sandbox_mode==='read-only',approvalNever:config?.approval_policy==='never',
+  };
+}
 export function createCodexProvider({root,spawnImpl=spawn,findBinary=findCodexBinary}={}){
   const home=path.join(root,'codex-home'),workspace=path.join(root,'codex-workspace'),systemHome=path.join(root,'codex-system-home');
-  let child=null,initializing=null,nextId=0,buffer='',active=null,ready=false,restrictedModeVerified=false;
+  let child=null,initializing=null,nextId=0,buffer='',active=null,ready=false,restrictedModeVerified=false,closed=false;
+  let restrictionChecks={},diagnostics={phase:'not-started',initializeCompleted:false,configReadCompleted:false,accountReadCompleted:false};
   const pending=new Map();let loginState={loginPending:false};
   function send(value){if(!child?.stdin?.writable)throw fail('CODEX_NOT_RUNNING');child.stdin.write(JSON.stringify(value)+'\n');}
   function request(method,params={},timeoutMs=15000){
@@ -89,28 +102,47 @@ export function createCodexProvider({root,spawnImpl=spawn,findBinary=findCodexBi
     if(message.method==='error')active.reject(fail('CODEX_TURN_FAILED'));
   }
   async function ensure(config){
+    if(closed)throw fail('CODEX_PROVIDER_CLOSED');
     if(ready)return;
     if(initializing)return initializing;
     initializing=(async()=>{
+      restrictionChecks={};diagnostics={phase:'find-binary',initializeCompleted:false,configReadCompleted:false,accountReadCompleted:false};
       const binary=await findBinary(config.codex.cliPath);if(!binary)throw fail('CODEX_CLI_MISSING');
-      for(const folder of [home,workspace,systemHome,path.join(root,'codex-tmp'),path.join(systemHome,'Roaming'),path.join(systemHome,'Local')])await storageSecurity.directory(folder);
+      diagnostics.phase='prepare-storage';
+      for(const folder of [home,workspace,systemHome,path.join(root,'codex-tmp'),path.join(systemHome,'Roaming'),path.join(systemHome,'Local')]){if(closed)throw fail('CODEX_PROVIDER_CLOSED');await storageSecurity.directory(folder);}
       for(const name of ['auth.json','config.toml','requirements.toml']){try{await storageSecurity.protectExisting(path.join(home,name));}catch(error){if(error.code!=='ENOENT')throw error;}}
+      const canonicalHome=await fs.realpath(home);
       const args=['app-server','--listen','stdio://',...Object.entries(CODEX_CONFIG).flatMap(([key,value])=>['-c',`${key}=${JSON.stringify(value)}`])];
       const env=createCodexEnvironment({root,binary});
+      if(closed)throw fail('CODEX_PROVIDER_CLOSED');
+      diagnostics.phase='initialize';
       child=spawnImpl(binary,args,{cwd:workspace,env,stdio:['pipe','pipe','pipe'],windowsHide:true});buffer='';
       const owned=child;
       const decoder=new TextDecoder();
       child.stdout.on('data',chunk=>{buffer+=decoder.decode(chunk,{stream:true});if(Buffer.byteLength(buffer)>2*1024*1024){stopChild();return;}while(buffer.includes('\n')){const index=buffer.indexOf('\n'),line=buffer.slice(0,index);buffer=buffer.slice(index+1);try{receive(JSON.parse(line));}catch{stopChild();return;}}});
-      child.stderr.on('data',()=>{}); // Provider/auth errors must never enter logs.
-      child.on('error',()=>{if(child===owned)rejectAll();});child.on('exit',()=>{if(child===owned){child=null;rejectAll();}});
+      child.stderr.on('data',chunk=>{
+        // Classify only; never retain or return upstream text, paths or accounts.
+        const value=chunk.toString('utf8').slice(0,4096);
+        if(/environment|SystemRoot|USERPROFILE|APPDATA/i.test(value))diagnostics.stderrCategory='system-environment';
+        else if(/permission|access.*denied|Unauthorized/i.test(value))diagnostics.stderrCategory='permissions';
+        else if(/config|toml|unknown.*field/i.test(value))diagnostics.stderrCategory='configuration';
+        else if(/not.*found|missing|No such file/i.test(value))diagnostics.stderrCategory='missing-component';
+        else if(!diagnostics.stderrCategory)diagnostics.stderrCategory='other';
+      });
+      child.on('error',()=>{if(child===owned){diagnostics.processStartFailed=true;rejectAll();}});child.on('exit',code=>{if(child===owned){if(Number.isInteger(code))diagnostics.exitCode=code;child=null;rejectAll();}});
       const initialized=await request('initialize',{clientInfo:{name:'whale_pet_desktop',version:'0.2.0'}});
+      diagnostics.initializeCompleted=true;diagnostics.phase='config-read';
       send({method:'initialized'});
-      const version=initialized?.userAgent?.match(/\/(\d+\.\d+\.\d+)/)?.[1];
       const effective=await request('config/read',{includeLayers:false});
+      diagnostics.configReadCompleted=true;
       // ConfigReadResponse.ToolsV2 projects only web_search in 0.164, so it
       // cannot echo view_image. That documented option is always passed above;
       // verify every observable restriction, but never claim a no-tools table.
-      restrictedModeVerified=/^0\.164\.\d+$/.test(version||'')&&sameCodexHome(initialized.codexHome,home)&&effective?.config?.features?.shell_tool===false&&['apps','multi_agent','browser_use','computer_use','remote_plugin','tool_suggest'].every(key=>effective.config.features[key]===false)&&effective.config.web_search==='disabled'&&effective.config.project_doc_max_bytes===0&&Object.keys(effective.config.mcp_servers||{}).length===0&&effective.config.sandbox_mode==='read-only'&&effective.config.approval_policy==='never';
+      // Only canonicalize our own already-created directory. Never resolve an
+      // arbitrary path received from the server. Windows may expand 8.3 aliases.
+      restrictionChecks=codexRestrictionChecks({initialized,effective,home,canonicalHome});
+      restrictedModeVerified=Object.values(restrictionChecks).every(value=>value===true);
+      diagnostics.phase=restrictedModeVerified?'ready':'restriction-check';
       ready=true;
     })();
     try{await initializing;}catch(error){stopChild();throw error;}finally{initializing=null;}
@@ -118,8 +150,8 @@ export function createCodexProvider({root,spawnImpl=spawn,findBinary=findCodexBi
   return{
     async status(config){
       const available=!!await findBinary(config.codex.cliPath);if(!available)return{available:false,authenticated:false,loginPending:false,message:'尚未找到官方 Codex CLI；API 或离线模式仍可使用。'};
-      try{await ensure(config);const result=await request('account/read',{refreshToken:false});return{available:true,authenticated:result.account?.type==='chatgpt',restrictedModeVerified,...loginState,...(!restrictedModeVerified?{message:'当前 CLI 版本或受限配置尚未通过核查；登录可用，AI 生成暂不开放。'}:{}),...(loginState.authUrl?{url:loginState.authUrl}:{})};}
-      catch(error){return{available:true,authenticated:false,loginPending:false,restrictedModeVerified:false,errorCode:error?.code||'CODEX_UNAVAILABLE',message:'Codex 服务尚未就绪，请检查官方 CLI 版本与路径。'};}
+      try{await ensure(config);const result=await request('account/read',{refreshToken:false});diagnostics.accountReadCompleted=true;return{available:true,authenticated:result.account?.type==='chatgpt',restrictedModeVerified,restrictionChecks:{...restrictionChecks},diagnostics:{...diagnostics},...loginState,...(!restrictedModeVerified?{message:'当前 CLI 版本或受限配置尚未通过核查；登录可用，AI 生成暂不开放。'}:{}),...(loginState.authUrl?{url:loginState.authUrl}:{})};}
+      catch(error){return{available:true,authenticated:false,loginPending:false,restrictedModeVerified:false,restrictionChecks:{...restrictionChecks},diagnostics:{...diagnostics},errorCode:error?.code||'CODEX_UNAVAILABLE',message:'Codex 服务尚未就绪，请检查官方 CLI 版本与路径。'};}
     },
     async login(config){await ensure(config);const result=await request('account/login/start',{type:'chatgpt'});let url;try{url=new URL(result.authUrl);}catch{throw fail('CODEX_LOGIN_URL_INVALID');}if(url.protocol!=='https:'||!['auth.openai.com','chatgpt.com','auth0.openai.com'].includes(url.hostname))throw fail('CODEX_LOGIN_URL_INVALID');loginState={loginPending:true,loginId:result.loginId,authUrl:url.href};return{type:'chatgpt',...loginState,url:url.href};},
     async cancelLogin(config,{loginId}={}){await ensure(config);if(loginId)await request('account/login/cancel',{loginId});loginState={loginPending:false};return{success:true};},
@@ -144,6 +176,6 @@ export function createCodexProvider({root,spawnImpl=spawn,findBinary=findCodexBi
         return{text:result.text.trim().slice(0,16000),model:config.model||'codex-default',source:'codex',usage,usageIncomplete:!raw,usageScope:'codex-thread-reported',modelCalls:1,modelCallsAreTurns:true,toolCalls:0};
       }finally{cleanup?.();active=null;}
     },
-    async close(){await closeChild();},
+    async close(){closed=true;await closeChild();},
   };
 }

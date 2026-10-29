@@ -118,6 +118,16 @@ def category_counts(records):
 def gates(reports):
     smoke, audit, backend, ui = reports
     check(smoke.get('pass') is True and smoke.get('native', {}).get('passed') is True, 'WINDOWS_SMOKE_NOT_PASSED')
+    native_service = smoke.get('nativeService', {})
+    check(native_service.get('passed') is True, 'NATIVE_PRODUCTION_SERVICE_NOT_PASSED')
+    check(all(native_service.get(key) is False for key in ('guiStarted', 'loginPerformed', 'modelRequests',
+              'desktopCaptured', 'providerCredentialsRead', 'defaultUserDataRead', 'normalDesktopValidated')), 'NATIVE_SERVICE_SIDE_EFFECT_BOUNDARY')
+    check(native_service.get('checks', {}).get('production-client-not-synthetic') is True
+          and native_service.get('checks', {}).get('state-owned-by-exact-child') is True
+          and native_service.get('checks', {}).get('private-data-root-dacl') is True
+          and native_service.get('checks', {}).get('owned-child-exited-cleanly') is True
+          and native_service.get('checks', {}).get('owned-state-file-removed') is True
+          and native_service.get('checks', {}).get('temporary-root-cleaned') is True, 'NATIVE_SERVICE_LIFECYCLE_INCOMPLETE')
     check(audit.get('pass') is True, 'WINDOWS_AUDIT_NOT_PASSED')
     check(backend.get('pass') is True and backend.get('summaryComplete') is True, 'BACKEND_TESTS_NOT_PASSED')
     totals = backend.get('totals', {})
@@ -170,6 +180,7 @@ def validation_markdown(version, reports, source_summary):
 
 - 后端测试：共 {totals['tests']}，通过 {totals['pass']}，失败 {totals['fail']}，跳过 {totals['skipped']}。
 - 离屏 WPF 合成检查：{len(ui.get('checks', {}))} 项；包括透明窗口属性、动作、二维规划、气泡、聊天与连接设置的合成控件渲染。
+- 真实 C# 生产客户端生命周期：在全新临时根目录运行 ServiceClient 的 Node 启动、进程归属、私有数据权限、本机 HTTP 默认状态与正常退出/状态清理检查；没有启动普通桌面 GUI。
 - 实际发行目录、便携 ZIP、安装器及安装后文件经过字节核对；安装、卸载及合成用户数据保留检查已通过。
 - 已提交 HEAD 的干净源码归档实际经过隐私审计：{source_summary['files']} 个检查对象，{source_summary['findingsCount']} 项未通过发现。
 

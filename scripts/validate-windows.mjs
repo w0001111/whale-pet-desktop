@@ -11,12 +11,12 @@ const report={schemaVersion:1,platform:process.platform,pass:false,checks:[],mod
 const check=(value,code)=>{if(!value)throw Object.assign(new Error(code),{code});};
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 let temporary,child,childDone,exited=false;
-function command(exe,args,env,timeout=120000){return new Promise((resolve,reject)=>{
+function command(exe,args,env,timeout=120000,captureJson=null){return new Promise((resolve,reject)=>{
   const proc=spawn(exe,args,{env,windowsHide:true,stdio:['ignore','pipe','pipe']});let text='',error='';
   const timer=setTimeout(()=>{proc.kill();reject(Object.assign(new Error('COMMAND_TIMEOUT'),{code:'COMMAND_TIMEOUT'}));},timeout);
   proc.stdout.on('data',c=>text+=c);proc.stderr.on('data',c=>error+=c);
   proc.on('error',()=>{clearTimeout(timer);reject(Object.assign(new Error('COMMAND_START_FAILED'),{code:'COMMAND_START_FAILED'}));});
-  proc.on('exit',code=>{clearTimeout(timer);code===0?resolve(text.trim()):reject(Object.assign(new Error('COMMAND_FAILED'),{code:'COMMAND_FAILED'}));});
+  proc.on('close',code=>{clearTimeout(timer);if(captureJson){try{report[captureJson]=JSON.parse(text.trim());}catch{}}code===0?resolve(text.trim()):reject(Object.assign(new Error('COMMAND_FAILED'),{code:'COMMAND_FAILED'}));});
 });}
 try{
   check(process.platform==='win32','WINDOWS_REQUIRED');
@@ -39,6 +39,11 @@ try{
   await command(native,['--self-test','--self-test-output',ui],env,180000);
   report.native=JSON.parse(await fs.readFile(path.join(ui,'self-test.json'),'utf8'));
   check(report.native.passed===true,'WPF_SELF_TEST');report.checks.push('synthetic-wpf-controls-animation-and-rendering');
+  await command(native,['--service-self-test'],env,180000,'nativeService');
+  check(report.nativeService.passed===true,'NATIVE_PRODUCTION_SERVICE_SELF_TEST');
+  check(report.nativeService.guiStarted===false&&report.nativeService.loginPerformed===false&&report.nativeService.modelRequests===false
+    &&report.nativeService.desktopCaptured===false&&report.nativeService.providerCredentialsRead===false&&report.nativeService.defaultUserDataRead===false,'NATIVE_SERVICE_SIDE_EFFECTS');
+  report.checks.push('production-csharp-client-process-loopback-http-and-shutdown');
   child=spawn(node,[path.join(app,'service','service.mjs')],{env:{...env,WHALE_PET_PORT:'0',WHALE_PET_PARENT_IPC:'1'},cwd:root,windowsHide:true,stdio:['pipe','pipe','pipe']});
   child.stdout.on('data',()=>{});child.stderr.on('data',()=>{});
   childDone=new Promise((resolve,reject)=>{child.on('error',()=>reject(new Error('SERVICE_START_FAILED')));child.on('exit',code=>{exited=true;resolve(code);});});
@@ -64,6 +69,10 @@ try{
   const usage=await request('/api/usage');check(usage.today.modelCalls===0&&usage.today.usage.totalTokens===0,'ZERO_MODEL_USAGE');
   report.checks.push('local-todos-memory-real-timer-and-usage');
   const status=await request('/api/codex/status');
+  report.codexEmptyHome={available:status.available===true,authenticated:status.authenticated===true,restrictedModeVerified:status.restrictedModeVerified===true,
+    ...(typeof status.errorCode==='string'&&/^[A-Z0-9_]{2,80}$/.test(status.errorCode)?{errorCode:status.errorCode}:{}),
+    restrictionChecks:Object.fromEntries(Object.entries(status.restrictionChecks||{}).filter(([key,value])=>['versionPinned','isolatedHome','shellDisabled','featuresDisabled','webSearchDisabled','projectDocsDisabled','noMcpServers','readOnlySandbox','approvalNever'].includes(key)&&typeof value==='boolean')),
+    diagnostics:Object.fromEntries(Object.entries(status.diagnostics||{}).filter(([key,value])=>(['initializeCompleted','configReadCompleted','accountReadCompleted','processStartFailed'].includes(key)&&typeof value==='boolean')||(key==='exitCode'&&Number.isInteger(value))||(key==='phase'&&['not-started','find-binary','prepare-storage','initialize','config-read','ready','restriction-check'].includes(value))||(key==='stderrCategory'&&['system-environment','permissions','configuration','missing-component','other'].includes(value))))};
   check(status.available===true&&status.authenticated===false&&status.restrictedModeVerified===true,'CODEX_EMPTY_HOME_RESTRICTIONS');
   report.checks.push('bundled-codex-empty-home-protocol-no-login');
   child.stdin.end(JSON.stringify({type:'shutdown'})+'\n');

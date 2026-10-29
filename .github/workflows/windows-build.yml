@@ -33,14 +33,19 @@ jobs:
       - name: Verify Windows private storage before running regressions
         timeout-minutes: 2
         run: '& .cache/windows-runtime/x64/bin/node.exe scripts/windows-acl-preflight.mjs'
+      - name: Verify official Codex protocol in an empty isolated home
+        timeout-minutes: 2
+        run: '& .cache/windows-runtime/x64/bin/node.exe scripts/windows-codex-preflight.mjs'
       - name: Run shared backend regressions on Windows
         timeout-minutes: 12
         run: python scripts/run-windows-backend-tests.py
       - name: Build native application, portable ZIP and installer
+        id: package
         run: python scripts/package-windows.py
       - name: Validate isolated native UI and bundled services
         run: '& .cache/windows-runtime/x64/bin/node.exe scripts/validate-windows.mjs --app "dist/windows-x64/Whale Pet" --output build/windows-validation'
       - name: Verify installed payload, privacy and provenance
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         run: python scripts/audit-windows.py
       - name: Finalize checksums and clean source archive
         run: python scripts/finalize-windows-release.py

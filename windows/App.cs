@@ -18,6 +18,7 @@ public static class Program
     {
         if (Array.IndexOf(args, "--version") >= 0) { Console.WriteLine("Whale Pet " + Version); return 0; }
         if (Array.IndexOf(args, "--diagnostics") >= 0) { Diagnostics(); return 0; }
+        if (Array.IndexOf(args, "--service-self-test") >= 0) return WindowsServiceSelfTest.RunAsync().GetAwaiter().GetResult();
         if (Array.IndexOf(args, "--self-test") >= 0)
         {
             string? output = null;

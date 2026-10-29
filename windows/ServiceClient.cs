@@ -23,6 +23,9 @@ public sealed class ServiceClient : IAsyncDisposable
     public string ResourceRoot { get; }
     public bool IsSyntheticTestRoot { get; }
     public bool IsRunning => _process is { HasExited: false } && _baseUri != null;
+    internal int? OwnedProcessId => _process is { HasExited: false } ? _process.Id : null;
+    internal bool OwnedJobAttached => _job != null;
+    internal bool UsesLoopbackEndpoint => _baseUri is { Scheme: "http", Host: "127.0.0.1" };
     public Task ReadyTask => _ready.Task;
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly HttpClient _http;

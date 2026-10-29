@@ -6,7 +6,7 @@ import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {PassThrough} from 'node:stream';
 import {appDataRoot,privateRead,privateWrite} from './provider-config.mjs';
-import {findCodexBinary,createCodexEnvironment,sameCodexHome} from './codex-provider.mjs';
+import {findCodexBinary,createCodexEnvironment,sameCodexHome,codexRestrictionChecks,CODEX_CONFIG} from './codex-provider.mjs';
 import {createStorageSecurity,windowsAclCommand,executePrivateCommand,preparePrivateCommand} from './private-storage.mjs';
 import {attachParentIpc} from './service.mjs';
 import {assertPrivateFile,directoryLink} from './test/platform.mjs';
@@ -35,6 +35,18 @@ test('Windows Codex gets isolated profile, roaming/local app data and temp witho
   assert.equal(sameCodexHome('\\\\?\\C:\\Synthetic\\Codex','c:/synthetic/codex',{platform:'win32'}),true);
   assert.equal(sameCodexHome('C:\\Other','C:\\Synthetic\\Codex',{platform:'win32'}),false);
 });
+test('Codex accepts only its own canonical Windows home alias and keeps every other restriction mandatory',()=>{
+  const home='C:\\Users\\RUNNER~1\\Temp\\WhalePet\\codex-home',canonicalHome='C:\\Users\\RunnerSynthetic\\Temp\\WhalePet\\codex-home';
+  const initialized={userAgent:'codex_cli_rs/0.164.0',codexHome:'\\\\?\\C:\\Users\\RunnerSynthetic\\Temp\\WhalePet\\codex-home'};
+  const effective={config:{features:{shell_tool:false,apps:false,multi_agent:false,browser_use:false,computer_use:false,remote_plugin:false,tool_suggest:false},web_search:'disabled',project_doc_max_bytes:0,mcp_servers:{},sandbox_mode:'read-only',approval_policy:'never'}};
+  const input={home,canonicalHome,initialized,effective,platform:'win32'};
+  assert.equal(sameCodexHome(initialized.codexHome,home,{platform:'win32'}),false);
+  const checks=codexRestrictionChecks(input);assert.ok(Object.values(checks).every(value=>value===true));
+  assert.equal(codexRestrictionChecks({...input,initialized:{...initialized,codexHome:'C:\\Other\\codex-home'}}).isolatedHome,false);
+  assert.equal(codexRestrictionChecks({...input,canonicalHome:undefined}).isolatedHome,false);
+  for(const [field,value]of [['sandbox_mode','workspace-write'],['approval_policy','on-request'],['web_search','enabled']]){const modified=structuredClone(input);modified.effective.config[field]=value;assert.ok(Object.values(codexRestrictionChecks(modified)).includes(false));}
+  assert.equal(CODEX_CONFIG['features.shell_tool'],false);assert.equal(CODEX_CONFIG['tools.view_image'],false);
+});
 test('private ACL invocation is literal, no-profile, bounded and grants only current SID plus SYSTEM',()=>{
   const target="C:\\Synthetic\\quote'$(not-code)\\data",command=windowsAclCommand(target,true,{env:{SystemRoot:'C:\\Windows',OPENAI_API_KEY:'SYNTHETIC-DO-NOT-INHERIT'}});
   const script=Buffer.from(command.args.at(-1),'base64').toString('utf16le');
@@ -48,7 +60,7 @@ test('private helper closes stdin rather than leaving a child waiting on the par
   const {stdout}=await executePrivateCommand(process.execPath,['-e','process.stdin.resume();process.stdin.once("end",()=>process.stdout.write("SYNTHETIC-EOF"));'],{timeout:2000,windowsHide:true});
   assert.equal(stdout,'SYNTHETIC-EOF');
 });
-test('ACL helper profile is an ephemeral separate home, removed after success or child failure',async()=>{
+test('ACL helper profile is an ephemeral separate home, removed after success or child failure',async t=>{
   const prepared=await preparePrivateCommand({isolatedProfile:true,env:{SYNTHETIC_SETTING:'1'}});
   const profile=prepared.options.env.USERPROFILE;
   assert.ok(profile.startsWith(os.tmpdir()));assert.notEqual(prepared.options.env.APPDATA,profile);assert.equal(prepared.options.isolatedProfile,undefined);
@@ -57,7 +69,9 @@ test('ACL helper profile is an ephemeral separate home, removed after success or
   const script='process.stdout.write(process.env.USERPROFILE);';
   childProfile=(await executePrivateCommand(process.execPath,['-e',script],{isolatedProfile:true,timeout:2000,env:{}})).stdout;
   await assert.rejects(fs.stat(childProfile),{code:'ENOENT'});
-  await assert.rejects(executePrivateCommand(process.execPath,['-e','process.exit(2)'],{isolatedProfile:true,timeout:2000,env:{}}),error=>error.code===2);
+  const marker=path.join(await temporary(t),'synthetic-child-profile.txt');
+  await assert.rejects(executePrivateCommand(process.execPath,['-e','require("node:fs").writeFileSync(process.argv[1],process.env.USERPROFILE);process.exit(2);',marker],{isolatedProfile:true,timeout:2000,env:{}}),error=>error.code===2);
+  const failedProfile=await fs.readFile(marker,'utf8');await assert.rejects(fs.stat(failedProfile),{code:'ENOENT'});
 });
 test('Windows private storage applies ACL only to app data, caches secured identities and never uses O_NOFOLLOW',async t=>{
   const root=await temporary(t),directory=path.join(root,'data'),calls=[],flags=[];
