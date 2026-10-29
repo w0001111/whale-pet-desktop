@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -116,6 +117,147 @@ def run(command, env, timeout=120, failure='COMMAND_FAILED'):
     return result.stdout
 
 
+def nuget_output_categories(text):
+    """Return fixed diagnostic labels; never publish captured command text."""
+    patterns = {
+        'package-integrity': r'\bNU3008\b',
+        'invalid-signature-or-platform': r'\bNU3003\b',
+        'unsigned-package': r'\bNU3004\b',
+        'revocation-unavailable': r'CRYPT_E_REVOCATION_OFFLINE|0x80092013|OfflineRevocation|RevocationStatusUnknown|revocation.{0,160}(?:could not|unable|unavailable|offline|not be reached)',
+        'certificate-revoked': r'CERT_E_REVOKED|0x800b010c|certificate.{0,80}(?:has been|was|is) revoked',
+        'untrusted-root': r'UntrustedRoot|CERT_E_UNTRUSTEDROOT|0x800b0109|root certificate.{0,80}not trusted|terminated in a root certificate',
+        'certificate-time': r'NotTimeValid|CERT_E_EXPIRED|0x800b0101|certificate.{0,80}expired',
+        'certificate-chain': r'\bNU30(?:18|28|42)\b|chain building issue',
+        'crypto-api': r'CryptographicException|AppleCrypto|Crypt32',
+        'sdk-resolution': r'\bNETSDK\d{4}\b|compatible .NET SDK|SDK.{0,80}not found|could not execute because',
+        'access-denied': r'UnauthorizedAccess|access.{0,30}denied|SecurityException',
+        'network': r'HttpRequestException|NameResolution|SocketException|connection.{0,40}(?:failed|refused)|SSL connection.{0,40}(?:failed|could not)|timed? out',
+    }
+    return sorted(name for name, pattern in patterns.items() if re.search(pattern, text, re.I))
+
+
+def probe_nuget_signature(dotnet, archive, package, version, env, profile='isolated'):
+    """Run the real verifier, retaining only codes, timing and fixed categories."""
+    started = time.monotonic()
+    record = {'package': package, 'version': version, 'profile': profile,
+              'verified': False, 'commandStarted': False, 'timedOut': False,
+              'exitCode': None, 'nugetCodes': [], 'outputCategories': []}
+    # Deterministic language improves category diagnostics without inheriting any
+    # developer account environment. Online revocation remains the default.
+    command_env = {**env, 'DOTNET_CLI_UI_LANGUAGE': 'en-US', 'NUGET_CERT_REVOCATION_MODE': 'online',
+                   'DOTNET_SKIP_FIRST_TIME_EXPERIENCE': '1'}
+    record['revocationMode'] = 'online'
+    text = ''
+    try:
+        result = subprocess.run([str(dotnet), 'nuget', 'verify', str(archive), '--all', '--verbosity', 'detailed',
+                                 '--configfile', str(ROOT / 'NuGet.Config')],
+                                cwd=ROOT, env=command_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding='utf-8', errors='replace', timeout=180,
+                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        record.update(commandStarted=True, exitCode=result.returncode, verified=result.returncode == 0)
+        text = result.stdout + '\n' + result.stderr
+    except subprocess.TimeoutExpired as error:
+        record.update(commandStarted=True, timedOut=True)
+        def decoded(value):
+            return value.decode('utf-8', errors='replace') if isinstance(value, bytes) else (value or '')
+        text = decoded(error.stdout) + '\n' + decoded(error.stderr)
+    except OSError:
+        record['outputCategories'] = ['verifier-start-failed']
+    record['elapsedMs'] = round((time.monotonic() - started) * 1000)
+    record['nugetCodes'] = sorted(set(re.findall(r'\bNU\d{4}\b', text)))
+    record['outputCategories'] = sorted(set(record['outputCategories']) | set(nuget_output_categories(text)))
+    return record
+
+
+def ci_signature_environment(isolated):
+    # This exception is only for official-package certificate verification on
+    # ephemeral GitHub-hosted Windows runners. App/service probes never use it.
+    if os.name != 'nt' or os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted':
+        return None
+    result = dict(isolated)
+    for name in ('USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOME', 'SystemRoot', 'WINDIR', 'PATH',
+                 'COMSPEC', 'PATHEXT', 'DOTNET_ROOT', 'DOTNET_CLI_HOME',
+                 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'):
+        value = os.environ.get(name)
+        if value:
+            result[name] = value
+    return result
+
+
+def nuget_archive(package, version):
+    folder = ROOT / '.cache/nuget' / package / version
+    archive = regular(folder / (package + '.' + version + '.nupkg'))
+    expected = regular(Path(str(archive) + '.sha512')).read_text(encoding='utf-8-sig').strip()
+    digest512 = sha(archive, 'sha512')
+    check(base64.b64encode(bytes.fromhex(digest512)).decode() == expected, 'NUGET_ARCHIVE_SHA512')
+    return archive, sha(archive), digest512
+
+
+def verify_nuget_package(dotnet, archive, package, version, env, report, preferred='isolated'):
+    profiles = {'isolated': env}
+    ci_environment = ci_signature_environment(env)
+    if ci_environment is not None:
+        profiles['ci-build-profile'] = ci_environment
+    if preferred not in profiles:
+        preferred = 'isolated'
+    check_record = probe_nuget_signature(dotnet, archive, package, version, profiles[preferred], preferred)
+    check_record['archiveSHA256'] = sha(archive)
+    report.setdefault('nugetSignatureChecks', []).append(check_record)
+    if not check_record['verified'] and preferred == 'isolated' and ci_environment is not None:
+        check_record = probe_nuget_signature(dotnet, archive, package, version, ci_environment, 'ci-build-profile')
+        check_record['archiveSHA256'] = sha(archive)
+        report['nugetSignatureChecks'].append(check_record)
+    check(check_record['verified'], 'NUGET_SIGNATURE_VERIFICATION_FAILED')
+    return check_record['profile']
+
+
+def recorded_signature_profile(package, archive_hash):
+    if ci_signature_environment({}) is None:
+        return 'isolated'
+    path = ROOT / 'build/windows-validation/nuget-preflight.json'
+    try:
+        check(regular(path).stat().st_size <= 1024 * 1024, 'NUGET_PREFLIGHT_REPORT_SIZE')
+        report = json.loads(path.read_text(encoding='utf-8'))
+        record = report.get('packages', {}).get(package, {})
+        if report.get('pass') is True and record.get('archiveSHA256') == archive_hash and record.get('signatureVerified') is True:
+            # This selects only an environment; actual bytes and signatures are
+            # always reverified below. A report never substitutes for verification.
+            return record.get('profile', 'isolated')
+    except (OSError, ValueError, AuditFailure):
+        pass
+    return 'isolated'
+
+
+def nuget_preflight(args):
+    report = {'schemaVersion': 1, 'pass': False, 'platform': 'windows', 'packages': {},
+              'modelRequests': 0, 'loginPerformed': False, 'desktopCaptured': False,
+              'nugetSignatureChecks': []}
+    output = ROOT / 'build/windows-validation/nuget-preflight.json'
+    try:
+        check(os.name == 'nt', 'WINDOWS_REQUIRED')
+        lock = json.loads((ROOT / 'windows-runtime-lock.json').read_text(encoding='utf-8'))
+        with tempfile.TemporaryDirectory(prefix='whale-nuget-preflight-') as raw:
+            temporary = Path(raw)
+            env = isolated_environment(temporary, temporary / 'application')
+            dotnet = shutil.which('dotnet', path=env['PATH'])
+            check(dotnet is not None, 'NUGET_SIGNATURE_VERIFIER_MISSING')
+            preferred = 'isolated'
+            for package in PACKAGES:
+                archive, archive_hash, digest512 = nuget_archive(package, lock['dotnetRuntimeVersion'])
+                preferred = verify_nuget_package(dotnet, archive, package, lock['dotnetRuntimeVersion'], env, report, preferred)
+                report['packages'][package] = {'version': lock['dotnetRuntimeVersion'], 'archiveSHA256': archive_hash,
+                    'archiveSHA512': digest512, 'sha512SidecarMatched': True, 'signatureVerified': True, 'profile': preferred}
+        report['pass'] = True
+    except AuditFailure as error:
+        report['error'] = {'code': str(error)}
+    except Exception:
+        report['error'] = {'code': 'NUGET_PREFLIGHT_FAILED'}
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+    print(json.dumps(report))
+    return 0 if report['pass'] else 1
+
+
 def zip_bytes(archive, member):
     entries = archive.infolist()
     matches = [entry for entry in entries if entry.filename == member]
@@ -175,19 +317,13 @@ def verify_originals(lock, temporary, scanner, env, report):
 
     nuget_records = []
     dotnet = shutil.which('dotnet', path=env['PATH'])
+    check(dotnet is not None, 'NUGET_SIGNATURE_VERIFIER_MISSING')
+    report['nugetSignatureChecks'] = []
     for package in PACKAGES:
-        folder = ROOT / '.cache/nuget' / package / lock['dotnetRuntimeVersion']
-        archive_file = regular(folder / (package + '.' + lock['dotnetRuntimeVersion'] + '.nupkg'))
-        checksum_file = regular(Path(str(archive_file) + '.sha512'))
-        expected_checksum = checksum_file.read_text(encoding='utf-8-sig').strip()
-        actual_checksum = base64.b64encode(bytes.fromhex(sha(archive_file, 'sha512'))).decode()
-        check(actual_checksum == expected_checksum, 'NUGET_ARCHIVE_SHA512')
-        archive_sha256, archive_sha512 = sha(archive_file), sha(archive_file, 'sha512')
-        signature_verified = False
-        if dotnet:
-            run([dotnet, 'nuget', 'verify', archive_file, '--all', '--verbosity', 'quiet'], env, timeout=180,
-                failure='NUGET_SIGNATURE_VERIFICATION_FAILED')
-            signature_verified = True
+        archive_file, archive_sha256, archive_sha512 = nuget_archive(package, lock['dotnetRuntimeVersion'])
+        signature_profile = verify_nuget_package(dotnet, archive_file, package, lock['dotnetRuntimeVersion'], env, report,
+            recorded_signature_profile(package, archive_sha256))
+        signature_verified = True
         with zipfile.ZipFile(archive_file) as archive:
             entries = archive.infolist()
             check(len(entries) <= 30000 and sum(entry.file_size for entry in entries) <= 3 * MAX_MEMBER,
@@ -214,7 +350,8 @@ def verify_originals(lock, temporary, scanner, env, report):
         nuget_records.append({'package': package, 'version': lock['dotnetRuntimeVersion'],
                               'archiveSHA256': archive_sha256, 'archiveSHA512': archive_sha512,
                               'sha512SidecarMatched': True, 'signatureVerifierAvailable': bool(dotnet),
-                              'signatureVerified': signature_verified})
+                              'signatureVerified': signature_verified, 'signatureProfile': signature_profile,
+                              'revocationMode': 'online'})
     report['microsoftRuntimeOriginals'] = nuget_records
     report['upstreamRawFindings'] = [{'path': name, 'line': line, 'category': category,
         'sha256': original_hashes[name]} for name, line, category in sorted(raw.findings)]
@@ -454,5 +591,6 @@ if __name__ == '__main__':
     parser.add_argument('--stage', default='dist/windows-x64/Whale Pet')
     parser.add_argument('--report', default='build/windows-validation/audit-windows.json')
     parser.add_argument('--self-test', action='store_true')
+    parser.add_argument('--nuget-preflight', action='store_true')
     args = parser.parse_args()
-    raise SystemExit(self_test() if args.self_test else main(args))
+    raise SystemExit(self_test() if args.self_test else nuget_preflight(args) if args.nuget_preflight else main(args))

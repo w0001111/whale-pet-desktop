@@ -30,6 +30,11 @@ jobs:
           dotnet-version: '10.0.403'
       - name: Verify official runtime archives
         run: python scripts/fetch-windows-runtime.py --include-installer
+      - name: Restore pinned Microsoft runtime packs
+        run: dotnet restore windows/WhalePet.Windows.csproj -r win-x64
+      - name: Verify Microsoft package signatures before packaging
+        timeout-minutes: 10
+        run: python scripts/audit-windows.py --nuget-preflight
       - name: Verify Windows private storage before running regressions
         timeout-minutes: 2
         run: '& .cache/windows-runtime/x64/bin/node.exe scripts/windows-acl-preflight.mjs'
