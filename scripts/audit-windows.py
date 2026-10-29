@@ -7,8 +7,10 @@ No model, account login, normal GUI launch or screen capture is performed.
 """
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -22,6 +24,7 @@ import tempfile
 import time
 import zipfile
 import xml.etree.ElementTree as ET
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = 'Whale-Pet-0.2.0-windows.1-windows-x64'
@@ -48,13 +51,120 @@ def sha(file, algorithm='sha256'):
     return value.hexdigest()
 
 
-def load_scanner():
+def load_scanner(cached=True):
     spec = importlib.util.spec_from_file_location('release_audit', ROOT / 'scripts/audit-release.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.RULES = [*module.RULES, ('windows_personal_absolute_path', re.compile(
         r'\b[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^\\/\s\x00\"\'<>]+', re.I))]
+    module.scan_cache_stats = {'uniqueLeafScans': 0, 'replayedLeafScans': 0}
+    if cached:
+        base_audit, cache = module.Audit, {}
+        class CachedAudit(base_audit):
+            def scan_bytes(self, content, name, depth=0):
+                lower = str(name).lower()
+                # Archive interpretation depends on the filename and recursion.
+                # Only leaf bytes can reuse a prior scan; path checks still run
+                # in scan_tree/ZIP traversal before this method is reached.
+                if lower.endswith(('.zip', '.dmg', *module.ARCHIVE_OTHER)) or len(content) > module.MAX_FILE_BYTES:
+                    return super().scan_bytes(content, name, depth)
+                key = (hashlib.sha256(content).digest(), len(content), depth)
+                if key not in cache:
+                    isolated = base_audit()
+                    isolated.scan_bytes(content, 'leaf', depth)
+                    check(isolated.files == 1 and isolated.archives == 0, 'LEAF_SCAN_CACHE_BOUNDARY')
+                    cache[key] = [(line, category) for _, line, category in isolated.findings]
+                    module.scan_cache_stats['uniqueLeafScans'] += 1
+                else:
+                    module.scan_cache_stats['replayedLeafScans'] += 1
+                self.files += 1
+                for line, category in cache[key]:
+                    self.add(name, line, category)
+        module.Audit = CachedAudit
     return module
+
+
+def safe_exception(error):
+    record = {'type': type(error).__name__}
+    for name in ('errno', 'winerror'):
+        value = getattr(error, name, None)
+        if type(value) is int:
+            record[name] = value
+    return record
+
+
+def cleanup_owned_temporary(folder, report, label, timeout=20):
+    """Retry only our freshly created temporary root; a durable failure fails."""
+    check(folder.parent.resolve() == Path(tempfile.gettempdir()).resolve()
+          and folder.name.startswith('whale-'), 'TEMPORARY_CLEANUP_TARGET_REJECTED')
+    record = {'scope': label, 'cleaned': False, 'attempts': 0}
+    report.setdefault('temporaryCleanup', []).append(record)
+    deadline = time.monotonic() + timeout
+    def readonly_retry(function, name, info):
+        candidate = Path(name)
+        check(candidate == folder or folder in candidate.parents, 'TEMPORARY_CLEANUP_TARGET_REJECTED')
+        if not isinstance(info[1], PermissionError) or candidate.is_symlink():
+            raise info[1]
+        attributes = candidate.lstat()
+        if getattr(attributes, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0):
+            raise info[1]
+        os.chmod(candidate, stat.S_IREAD | stat.S_IWRITE)
+        function(name)
+    while True:
+        record['attempts'] += 1
+        try:
+            check(not folder.is_symlink(), 'TEMPORARY_ROOT_LINK_REJECTED')
+            if folder.exists():
+                attributes = folder.lstat()
+                check(not getattr(attributes, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0), 'TEMPORARY_ROOT_LINK_REJECTED')
+                shutil.rmtree(folder, onerror=readonly_retry)
+            check(not folder.exists(), 'TEMPORARY_ROOT_REMAINS')
+            record['cleaned'] = True
+            report.setdefault('phases', {})[label + '-cleanup'] = True
+            return
+        except OSError as error:
+            record['lastException'] = safe_exception(error)
+            if time.monotonic() >= deadline:
+                raise AuditFailure('TEMPORARY_CLEANUP_FAILED') from None
+            time.sleep(.5)
+
+
+@contextmanager
+def audit_temporary(report, label):
+    folder = Path(tempfile.mkdtemp(prefix='whale-windows-' + label + '-'))
+    body_error = None
+    try:
+        yield folder
+    except BaseException as error:
+        body_error = error
+        report.setdefault('failedPhase', report.get('phase', label))
+        raise
+    finally:
+        if body_error is None:
+            report['phase'] = label + '-cleanup'
+        try:
+            cleanup_owned_temporary(folder, report, label)
+        except Exception as error:
+            report['cleanupException'] = safe_exception(error)
+            if body_error is None:
+                raise
+
+
+@contextmanager
+def audit_phase(report, label):
+    report['phase'] = label
+    report.setdefault('phases', {})[label] = False
+    started = time.monotonic()
+    try:
+        yield
+        report['phases'][label] = True
+    except BaseException:
+        report.setdefault('failedPhase', label)
+        raise
+    finally:
+        elapsed = round((time.monotonic() - started) * 1000)
+        report.setdefault('phaseElapsedMs', {})[label] = elapsed
+        print(json.dumps({'auditPhase': label, 'complete': report['phases'][label], 'elapsedMs': elapsed}), flush=True)
 
 
 def safe_member(name):
@@ -345,8 +455,8 @@ def zip_bytes(archive, member):
 def verify_originals(lock, temporary, scanner, env, report):
     """Re-hash archives and extract originals independently of runtime-manifest."""
     cache = ROOT / '.cache/windows-runtime'
-    originals, origins, raw = temporary / 'originals', {}, scanner.Audit()
-    original_hashes = {}
+    originals, origins = temporary / 'originals', {}
+    pending_scans = []
     originals.mkdir()
 
     def register(body, relative, source):
@@ -355,10 +465,9 @@ def verify_originals(lock, temporary, scanner, env, report):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(body)
         digest = sha(target)
-        original_hashes[relative] = digest
         record = {'path': relative, 'sha256': digest, 'size': len(body), **source}
         origins.setdefault(digest, []).append(record)
-        raw.scan_bytes(body, relative)
+        pending_scans.append((target, relative, digest))
         return digest
 
     node_archive = regular(cache / 'archives' / lock['nodeURL'].rsplit('/', 1)[-1])
@@ -429,14 +538,25 @@ def verify_originals(lock, temporary, scanner, env, report):
                               'signatureVerified': signature_verified, 'signatureProfile': signature_profile,
                               'revocationMode': 'online'})
     report['microsoftRuntimeOriginals'] = nuget_records
+    return origins, node_expected, pending_scans
+
+
+def scan_originals(pending_scans, scanner, report):
+    raw, original_hashes = scanner.Audit(), {}
+    for target, relative, digest in pending_scans:
+        body = regular(target).read_bytes()
+        check(hashlib.sha256(body).hexdigest() == digest, 'UPSTREAM_EXTRACTED_BYTES_CHANGED')
+        original_hashes[relative] = digest
+        raw.scan_bytes(body, relative)
     report['upstreamRawFindings'] = [{'path': name, 'line': line, 'category': category,
         'sha256': original_hashes[name]} for name, line, category in sorted(raw.findings)]
     report['upstreamOriginalFilesScanned'] = raw.files
-    return origins, node_expected
 
 
-def verify_payload(stage, manifest_file, portable, setup, lock, originals, expected, scanner, report):
-    manifest = json.loads(regular(manifest_file).read_text(encoding='utf-8'))
+def verify_payload_bytes(stage, manifest_file, portable, setup, expected, report):
+    manifest_body = regular(manifest_file).read_bytes()
+    report['manifestSHA256'] = hashlib.sha256(manifest_body).hexdigest()
+    manifest = json.loads(manifest_body.decode('utf-8'))
     check(manifest.get('platform') == 'windows' and manifest.get('architecture') == 'x64', 'MANIFEST_PLATFORM')
     files = inventory(stage)
     check(files == manifest['files'], 'MANIFEST_PAYLOAD_MISMATCH')
@@ -446,6 +566,8 @@ def verify_payload(stage, manifest_file, portable, setup, lock, originals, expec
     runtime = json.loads((stage / 'runtime/runtime-manifest.json').read_text(encoding='utf-8'))
     check(runtime.get('lockSHA256') == sha(ROOT / 'windows-runtime-lock.json'), 'RUNTIME_LOCK_MISMATCH')
     check(set(runtime['files']) == {name.removeprefix('runtime/') for name in expected}, 'RUNTIME_FILE_ALLOWLIST')
+    check({name.removeprefix('runtime/') for name in files if name.startswith('runtime/') and name != 'runtime/runtime-manifest.json'}
+          == set(runtime['files']), 'RUNTIME_PAYLOAD_FILE_ALLOWLIST')
     check(all(runtime['files'][name.removeprefix('runtime/')] == digest for name, digest in expected.items()), 'RUNTIME_RECORDED_HASH_MISMATCH')
     artifacts = {}
     for file in (portable, setup):
@@ -467,34 +589,97 @@ def verify_payload(stage, manifest_file, portable, setup, lock, originals, expec
             body = archive.read(entry)
             check(len(body) == files[relative]['size'] and hashlib.sha256(body).hexdigest() == files[relative]['sha256'], 'ZIP_PAYLOAD_BYTES')
         check(names == set(files), 'ZIP_FILE_TABLE')
-    raw = scanner.Audit()
-    raw.scan_tree(stage, 'payload', packaged=True)
-    raw.scan_bytes(manifest_file.read_bytes(), 'metadata/' + manifest_file.name)
-    raw.scan_bytes(setup.read_bytes(), 'installer/' + setup.name)
-    classified, unclassified = [], []
+    return files
 
-    def upstream_sources(relative, digest):
-        sources = originals.get(digest, [])
-        if relative in expected and expected[relative] == digest:
-            return sources
-        matched = []
-        for source in sources:
-            if source['kind'] != 'microsoft-runtime':
+
+def verify_project_payload(files, report):
+    spec = importlib.util.spec_from_file_location('package_inputs', ROOT / 'scripts/package-macos.py')
+    inputs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(inputs)
+    inputs.validate_production_inputs()
+    sources = [('service/' + name, ROOT / name) for name in inputs.SERVICE_FILES]
+    sources += [('service/assets/' + name, ROOT / 'assets' / name) for name in inputs.ASSET_FILES]
+    sources += [(name, ROOT / name) for name in inputs.PROJECT_NOTICES]
+    sources += [('INSTALL.zh-CN.md', ROOT / 'docs/INSTALL.windows.zh-CN.md')]
+    proof = {}
+    for relative, source in sources:
+        digest = sha(regular(source))
+        check(relative in files and files[relative]['sha256'] == digest, 'PROJECT_SOURCE_PAYLOAD_MISMATCH')
+        proof[relative] = digest
+    compiler = {}
+    for name in ('WhalePet.exe', 'WhalePet.dll'):
+        digest = sha(regular(ROOT / 'build/windows/publish' / name))
+        check(name in files and files[name]['sha256'] == digest, 'NATIVE_COMPILER_OUTPUT_MISMATCH')
+        compiler[name] = digest
+    report['projectSourcePayloadSHA256'] = proof
+    report['nativeCompilerOutputSHA256'] = compiler
+
+
+def payload_upstream_sources(relative, digest, originals, expected):
+    sources = originals.get(digest, [])
+    if relative in expected and expected[relative] == digest:
+        return sources
+    matched = []
+    for source in sources:
+        if source['kind'] != 'microsoft-runtime':
+            continue
+        member = source['member']
+        library = member.split('/lib/net10.0/', 1)[-1] if '/lib/net10.0/' in member else None
+        native = member.split('/native/', 1)[-1] if '/native/' in member else None
+        notice = 'licenses/' + source['package'] + '/' + member
+        if relative in (library, native, notice):
+            matched.append(source)
+    return matched
+
+
+def verify_framework_origins(files, originals, expected, report):
+    # Path/role and exact digest proof must finish before executing the installer,
+    # independently of whether privacy regexes find anything in a framework file.
+    matched = []
+    for relative, record in files.items():
+        if not relative.startswith('runtime/') and relative.lower().endswith(('.dll', '.exe')) and relative not in {'WhalePet.exe', 'WhalePet.dll'}:
+            sources = [source for source in payload_upstream_sources(relative, record['sha256'], originals, expected)
+                       if source['kind'] == 'microsoft-runtime']
+            check(bool(sources), 'FRAMEWORK_BINARY_ORIGIN_UNVERIFIED')
+            matched.append({'path': relative, 'sha256': record['sha256'], 'origins': sources})
+    report['microsoftPayloadFilesByteVerified'] = matched
+
+
+def scan_payload(stage, manifest_file, setup, originals, expected, scanner, report, files):
+    raw = scanner.Audit()
+    # Re-hash the exact buffers being scanned, after initial inventory/ZIP proof.
+    # Cache reuse therefore cannot hide a file changed since byte verification.
+    check(inventory(stage) == files, 'PAYLOAD_CHANGED_BEFORE_SCAN')
+    def scan_folder(folder):
+        for item in sorted(folder.iterdir()):
+            relative = item.relative_to(stage).as_posix()
+            name = 'payload/' + relative
+            attributes = item.lstat()
+            check(not item.is_symlink() and not getattr(attributes, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0),
+                  'PAYLOAD_LINK_REJECTED')
+            if raw.forbidden(name, directory=item.is_dir(), packaged=True):
                 continue
-            member = source['member']
-            # Provenance includes the distribution role/path, not merely a hash
-            # found somewhere in an unrelated vendor archive.
-            library = member.split('/lib/net10.0/', 1)[-1] if '/lib/net10.0/' in member else None
-            native = member.split('/native/', 1)[-1] if '/native/' in member else None
-            notice = 'licenses/' + source['package'] + '/' + member
-            if relative in (library, native, notice):
-                matched.append(source)
-        return matched
+            if item.is_dir():
+                scan_folder(item)
+                continue
+            check(relative in files, 'PAYLOAD_CHANGED_BEFORE_SCAN')
+            record = files[relative]
+            body = regular(item).read_bytes()
+            check(len(body) == record['size'] and hashlib.sha256(body).hexdigest() == record['sha256'], 'PAYLOAD_CHANGED_BEFORE_SCAN')
+            raw.scan_bytes(body, name)
+    scan_folder(stage)
+    manifest_body = regular(manifest_file).read_bytes()
+    check(hashlib.sha256(manifest_body).hexdigest() == report['manifestSHA256'], 'MANIFEST_CHANGED_BEFORE_SCAN')
+    raw.scan_bytes(manifest_body, 'metadata/' + manifest_file.name)
+    setup_body = regular(setup).read_bytes()
+    check(hashlib.sha256(setup_body).hexdigest() == report['artifacts'][setup.name]['sha256'], 'INSTALLER_CHANGED_BEFORE_SCAN')
+    raw.scan_bytes(setup_body, 'installer/' + setup.name)
+    classified, unclassified = [], []
 
     for name, line, category in sorted(raw.findings):
         relative = name.removeprefix('payload/') if name.startswith('payload/') else None
         record = {'path': name, 'line': line, 'category': category}
-        sources = upstream_sources(relative, files[relative]['sha256']) if relative in files else []
+        sources = payload_upstream_sources(relative, files[relative]['sha256'], originals, expected) if relative in files else []
         # Our own executable/assembly never receives a vendor exception.
         if sources and relative not in {'WhalePet.exe', 'WhalePet.dll'}:
             classified.append({**record, 'sha256': files[relative]['sha256'], 'origins': sources})
@@ -504,16 +689,14 @@ def verify_payload(stage, manifest_file, portable, setup, lock, originals, expec
                   unclassifiedFindings=unclassified, payloadFilesScanned=raw.files,
                   zipFilesByteVerified=len(files), runtimeFilesByteVerified=len(expected))
     check(not unclassified, 'UNCLASSIFIED_PAYLOAD_FINDINGS')
-    # Every distributed Microsoft framework binary needs original-package proof,
-    # independently of whether the privacy scanner happened to find a string.
-    matched = []
-    for relative, record in files.items():
-        if not relative.startswith('runtime/') and relative.lower().endswith(('.dll', '.exe')) and relative not in {'WhalePet.exe', 'WhalePet.dll'}:
-            sources = [source for source in upstream_sources(relative, record['sha256']) if source['kind'] == 'microsoft-runtime']
-            check(bool(sources), 'FRAMEWORK_BINARY_ORIGIN_UNVERIFIED')
-            matched.append({'path': relative, 'sha256': record['sha256'], 'origins': sources})
-    report['microsoftPayloadFilesByteVerified'] = matched
     return files
+
+
+def verify_payload(stage, manifest_file, portable, setup, lock, originals, expected, scanner, report):
+    """Compatibility entry point used by deterministic integrity self-tests."""
+    files = verify_payload_bytes(stage, manifest_file, portable, setup, expected, report)
+    verify_framework_origins(files, originals, expected, report)
+    return scan_payload(stage, manifest_file, setup, originals, expected, scanner, report, files)
 
 
 def existing_registration():
@@ -574,7 +757,8 @@ def install_audit(setup, expected, temporary, env, report):
 
 def main(args):
     report = {'schemaVersion': 1, 'pass': False, 'platform': 'windows', 'modelRequests': 0,
-              'loginPerformed': False, 'desktopCaptured': False, 'normalGuiStarted': False}
+              'loginPerformed': False, 'desktopCaptured': False, 'normalGuiStarted': False,
+              'phase': 'initialize', 'phases': {}}
     output = ROOT / args.report
     try:
         check(os.name == 'nt', 'WINDOWS_REQUIRED')
@@ -583,19 +767,32 @@ def main(args):
         lock = json.loads((ROOT / 'windows-runtime-lock.json').read_text(encoding='utf-8'))
         stage = ROOT / args.stage
         dist = ROOT / 'dist/windows'
-        with tempfile.TemporaryDirectory(prefix='whale-windows-audit-') as temporary_name:
-            temporary = Path(temporary_name)
+        with audit_temporary(report, 'originals') as temporary:
             env = isolated_environment(temporary, temporary / 'home/Local/WhalePet')
-            origins, expected = verify_originals(lock, temporary, scanner, env, report)
-            payload = verify_payload(stage, dist / (PREFIX + '.manifest.json'),
-                                     dist / (PREFIX + '-portable.zip'), dist / (PREFIX + '-setup.exe'),
-                                     lock, origins, expected, scanner, report)
-            install_audit(dist / (PREFIX + '-setup.exe'), payload, temporary, env, report)
+            with audit_phase(report, 'upstream-byte-origins'):
+                origins, expected, pending_scans = verify_originals(lock, temporary, scanner, env, report)
+            with audit_phase(report, 'payload-byte-proof'):
+                payload = verify_payload_bytes(stage, dist / (PREFIX + '.manifest.json'),
+                    dist / (PREFIX + '-portable.zip'), dist / (PREFIX + '-setup.exe'), expected, report)
+                verify_project_payload(payload, report)
+                verify_framework_origins(payload, origins, expected, report)
+            # The same real installer/uninstaller checks now complete, including
+            # their own cleanup, before any expensive regex pass begins.
+            with audit_temporary(report, 'installation') as install_temporary:
+                install_env = isolated_environment(install_temporary, install_temporary / 'home/Local/WhalePet')
+                with audit_phase(report, 'installation-lifecycle'):
+                    install_audit(dist / (PREFIX + '-setup.exe'), payload, install_temporary, install_env, report)
+            with audit_phase(report, 'upstream-privacy-scan'):
+                scan_originals(pending_scans, scanner, report)
+            with audit_phase(report, 'payload-privacy-scan'):
+                scan_payload(stage, dist / (PREFIX + '.manifest.json'), dist / (PREFIX + '-setup.exe'),
+                    origins, expected, scanner, report, payload)
+            report['scanCache'] = scanner.scan_cache_stats
+        report['phase'] = 'complete'
         report['pass'] = True
-    except AuditFailure as error:
-        report['error'] = {'code': str(error)}
-    except Exception:
-        report['error'] = {'code': 'WINDOWS_AUDIT_FAILED'}
+    except Exception as error:
+        report['error'] = {'code': str(error) if isinstance(error, AuditFailure) else 'WINDOWS_AUDIT_FAILED',
+                          'phase': report.get('failedPhase', report['phase']), **safe_exception(error)}
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print(json.dumps({'pass': report['pass'], 'report': output.relative_to(ROOT).as_posix(),
@@ -608,7 +805,63 @@ def main(args):
 
 def self_test():
     """Pure synthetic integrity/classification checks, never Windows execution."""
+    from unittest.mock import patch
     scanner = load_scanner()
+    uncached = load_scanner(cached=False)
+    cached_scan, original_scan = scanner.Audit(), uncached.Audit()
+    duplicate = b'\0token = ' + bytes([39]) + b'UPSTREAM' + b'-FIXTURE' * 3 + bytes([39])
+    def png_chunk(kind, body):
+        return len(body).to_bytes(4, 'big') + kind + body + zlib.crc32(kind + body).to_bytes(4, 'big')
+    metadata_png = b'\x89PNG\r\n\x1a\n' + png_chunk(b'IHDR', bytes.fromhex('00000001000000010806000000'))
+    metadata_png += png_chunk(b'zTXt', b'note\0\0' + zlib.compress(duplicate))
+    metadata_png += png_chunk(b'IDAT', zlib.compress(b'\0\0\0\0\0')) + png_chunk(b'IEND', b'')
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, 'w') as archive:
+        archive.writestr('first.txt', duplicate)
+        archive.writestr('second.txt', duplicate)
+    cases = [(duplicate, 'first.dll'), (duplicate, 'second.dll'), (metadata_png, 'meta.png'),
+             (metadata_png, 'meta-copy.png'), (archive_buffer.getvalue(), 'first.zip'),
+             (archive_buffer.getvalue(), 'second.zip'), (duplicate, 'unsupported.tgz'), (duplicate, 'unsupported.dmg')]
+    for body, relative in cases:
+        cached_scan.scan_bytes(body, relative)
+        original_scan.scan_bytes(body, relative)
+    check(cached_scan.findings == original_scan.findings and cached_scan.files == original_scan.files
+          and cached_scan.archives == original_scan.archives, 'SELF_TEST_CACHE_EQUIVALENCE')
+    check(scanner.scan_cache_stats['replayedLeafScans'] >= 4 and cached_scan.archives == 2, 'SELF_TEST_CACHE_REUSE_ARCHIVE_BOUNDARY')
+    framework_hash = hashlib.sha256(duplicate).hexdigest()
+    framework_files = {'Framework.dll': {'sha256': framework_hash, 'size': len(duplicate)}}
+    source = {'kind': 'microsoft-runtime', 'package': 'synthetic.runtime', 'member': 'runtimes/win-x64/native/Framework.dll'}
+    verify_framework_origins(framework_files, {framework_hash: [source]}, {}, {})
+    try:
+        verify_framework_origins(framework_files, {framework_hash: [{**source, 'member': 'runtimes/win-x64/native/Other.dll'}]}, {}, {})
+        raise AuditFailure('SELF_TEST_FRAMEWORK_ROLE_MUST_FAIL')
+    except AuditFailure as error:
+        check(str(error) == 'FRAMEWORK_BINARY_ORIGIN_UNVERIFIED', 'SELF_TEST_FRAMEWORK_ROLE_MUST_FAIL')
+    real_remove = shutil.rmtree
+    for durable in (False, True):
+        folder = Path(tempfile.mkdtemp(prefix='whale-cleanup-selftest-'))
+        (folder / 'owned.txt').write_text('SYNTHETIC-CLEANUP')
+        denied = PermissionError(13, 'SYNTHETIC-LOCK')
+        denied.winerror = 32
+        calls, cleanup_report = [], {}
+        def remove(target, **options):
+            calls.append(target)
+            if durable or len(calls) == 1:
+                raise denied
+            return real_remove(target, **options)
+        try:
+            with patch.object(shutil, 'rmtree', side_effect=remove), patch.object(time, 'sleep'):
+                try:
+                    cleanup_owned_temporary(folder, cleanup_report, 'synthetic', timeout=0 if durable else 2)
+                    check(not durable, 'SELF_TEST_DURABLE_CLEANUP_MUST_FAIL')
+                except AuditFailure as error:
+                    check(durable and str(error) == 'TEMPORARY_CLEANUP_FAILED', 'SELF_TEST_DURABLE_CLEANUP_MUST_FAIL')
+            record = cleanup_report['temporaryCleanup'][0]
+            check(record['cleaned'] is (not durable) and record['attempts'] == (1 if durable else 2)
+                  and record['lastException'] == {'type': 'PermissionError', 'errno': 13, 'winerror': 32}, 'SELF_TEST_CLEANUP_SAFE_DIAGNOSTICS')
+        finally:
+            if folder.exists():
+                real_remove(folder)
     with tempfile.TemporaryDirectory(prefix='whale-audit-selftest-') as name:
         root = Path(name)
         stage = root / 'payload'
@@ -649,6 +902,15 @@ def self_test():
         except AuditFailure as error:
             check(str(error) == 'UNCLASSIFIED_PAYLOAD_FINDINGS', 'SELF_TEST_OWN_ASSEMBLY_EXCEPTION')
             check(any(item['path'] == 'payload/service/service.mjs' for item in failed_report['unclassifiedFindings']), 'SELF_TEST_SERVICE_NO_VENDOR_EXCEPTION')
+        original_failed_report = {}
+        try:
+            verify_payload(stage, manifest_file, portable, setup, {}, origins, expected, uncached, original_failed_report)
+            raise AuditFailure('SELF_TEST_UNCACHED_OWN_ASSEMBLY_EXCEPTION')
+        except AuditFailure as error:
+            check(str(error) == 'UNCLASSIFIED_PAYLOAD_FINDINGS'
+                  and original_failed_report['unclassifiedFindings'] == failed_report['unclassifiedFindings']
+                  and original_failed_report['rawFindingsCount'] == failed_report['rawFindingsCount']
+                  and original_failed_report['payloadFilesScanned'] == failed_report['payloadFilesScanned'], 'SELF_TEST_UNCACHED_OWN_ASSEMBLY_EXCEPTION')
         (stage / 'WhalePet.dll').write_bytes(b'MZ\0SYNTHETIC-ASSEMBLY')
         (stage / 'service/service.mjs').write_text('export const synthetic=true;\n')
         bundle()
@@ -658,7 +920,34 @@ def self_test():
             raise AuditFailure('SELF_TEST_MANIFEST_TAMPER')
         except AuditFailure as error:
             check(str(error) == 'MANIFEST_PAYLOAD_MISMATCH', 'SELF_TEST_MANIFEST_TAMPER')
-    print('Windows audit synthetic integrity/classification self-test: PASS (no Windows execution)')
+        (stage / 'runtime/extra.dll').write_bytes(b'SYNTHETIC-UNLISTED-RUNTIME')
+        bundle()
+        try:
+            verify_payload_bytes(stage, manifest_file, portable, setup, expected, {})
+            raise AuditFailure('SELF_TEST_RUNTIME_ADDITION_MUST_FAIL')
+        except AuditFailure as error:
+            check(str(error) == 'RUNTIME_PAYLOAD_FILE_ALLOWLIST', 'SELF_TEST_RUNTIME_ADDITION_MUST_FAIL')
+        (stage / 'runtime/extra.dll').unlink()
+        # Additions and empty private directories remain visible after the
+        # early inventory, even though regex findings can now be replayed.
+        (stage / 'service/service.mjs').write_text('export const synthetic=true;\n')
+        bundle()
+        proof_report = {}
+        files = verify_payload_bytes(stage, manifest_file, portable, setup, expected, proof_report)
+        (stage / 'extra.txt').write_text('SYNTHETIC-ADDED')
+        try:
+            scan_payload(stage, manifest_file, setup, origins, expected, scanner, proof_report, files)
+            raise AuditFailure('SELF_TEST_ADDED_FILE_MUST_FAIL')
+        except AuditFailure as error:
+            check(str(error) == 'PAYLOAD_CHANGED_BEFORE_SCAN', 'SELF_TEST_ADDED_FILE_MUST_FAIL')
+        (stage / 'extra.txt').unlink()
+        (stage / 'data').mkdir()
+        try:
+            scan_payload(stage, manifest_file, setup, origins, expected, scanner, proof_report, files)
+            raise AuditFailure('SELF_TEST_EMPTY_PRIVATE_DIRECTORY_MUST_FAIL')
+        except AuditFailure as error:
+            check(str(error) == 'UNCLASSIFIED_PAYLOAD_FINDINGS', 'SELF_TEST_EMPTY_PRIVATE_DIRECTORY_MUST_FAIL')
+    print('Windows audit synthetic integrity/classification/cache/cleanup self-test: PASS (no Windows execution)')
     return 0
 
 
