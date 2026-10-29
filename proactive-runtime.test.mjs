@@ -1,3 +1,4 @@
+import {assertPrivateFile} from './test/platform.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -57,7 +58,7 @@ test('default disabled runtime never calls a model; explicit policy and fresh UI
   assert.equal(first.cursor, '0'); assert.deepEqual(first.messages, []);
   assert.equal(Date.parse(first.status.nextAt) - f.now(), 60_000);
   assert.equal(f.calls.length, 0);
-  assert.equal((await fs.stat(f.file)).mode & 0o777, 0o600);
+  await assertPrivateFile(f.file);
 });
 
 test('one wakeup dispatches one AI request, stores real usage and delivers exactly once by cursor', async t => {

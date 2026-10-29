@@ -25,7 +25,7 @@ APP_NAME = 'Whale Pet.app'
 SERVICE_FILES = (
     'service.mjs', 'desktop-backend.mjs', 'provider-config.mjs',
     'api-provider.mjs', 'codex-provider.mjs', 'companion-settings.mjs',
-    'local-memory.mjs', 'local-reminders.mjs', 'screen-policy.mjs',
+    'local-memory.mjs', 'local-reminders.mjs', 'screen-policy.mjs', 'private-storage.mjs',
     'usage-budget.mjs', 'proactive-runtime.mjs', 'web-tools.mjs',
     'official-task-runtime.mjs',
 )

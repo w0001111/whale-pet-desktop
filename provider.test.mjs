@@ -1,3 +1,5 @@
+import {assertPrivateFile} from './test/platform.mjs';
+import os from 'node:os';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -10,14 +12,14 @@ import {createCodexProvider,CODEX_CONFIG} from './codex-provider.mjs';
 import {createDesktopBackend} from './desktop-backend.mjs';
 import {createChatServer,createScreenBudget} from './service.mjs';
 
-async function fixture(t){const root=await fs.mkdtemp('/private/tmp/whale-public-provider-');t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
+async function fixture(t){const root=await fs.mkdtemp(path.join(os.tmpdir(),'whale-public-provider-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
 const fakeKey='TEST_ONLY_NOT_A_CREDENTIAL';
 const apiConfig={mode:'api',model:'mock-model',api:{format:'responses',baseURL:'https://example.com/v1',apiKey:fakeKey},codex:{cliPath:''}};
 const result={text:'测试回复',model:'mock-model',source:'api',usage:{input:10,output:2,cacheRead:0,cacheWrite:0,totalTokens:12},modelCalls:1,toolCalls:0};
 function rpcFixture({version='0.164.0',unsafe=false}={}){
   const requests=[],children=[];let spawnOptions;
   function spawnImpl(binary,args,options){
-    spawnOptions={binary,args,...options};const child=new EventEmitter();children.push(child);child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.kill=()=>{child.killed=true;setImmediate(()=>child.emit('exit',0));};
+    spawnOptions={binary,args,...options};const child=new EventEmitter();children.push(child);child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.kill=()=>{child.killed=true;setImmediate(()=>child.emit('exit',0));};child.stdin.once('finish',()=>setImmediate(()=>child.emit('exit',0)));
     const emit=message=>child.stdout.write(JSON.stringify(message)+'\n');let buffer='';
     child.stdin.on('data',chunk=>{buffer+=chunk;while(buffer.includes('\n')){const index=buffer.indexOf('\n'),message=JSON.parse(buffer.slice(0,index));buffer=buffer.slice(index+1);requests.push(message);if(!message.method)continue;
       let response={};
@@ -43,7 +45,7 @@ test('provider configuration is private, write-only for keys and switches modes 
   const root=await fixture(t),store=createProviderConfig({root});assert.equal((await store.get()).mode,'none');
   const saved=await store.configure(apiConfig);assert.equal(saved.api.hasKey,true);assert.equal(JSON.stringify(saved).includes(fakeKey),false);
   await store.configure({api:{apiKey:''}});assert.equal((await store.internal()).api.apiKey,fakeKey);
-  assert.equal((await fs.stat(path.join(root,'data','provider-config.json'))).mode&0o777,0o600);
+  await assertPrivateFile(path.join(root,'data','provider-config.json'));
   await store.configure({mode:'codex'});assert.equal((await store.get()).model,'');
   await store.configure({api:{clearKey:true}});assert.equal((await store.get()).api.hasKey,false);
   for(const baseURL of ['https://user:password@example.com/v1','http://example.com/v1','file:///private','https://example.com/v1?key=value'])await assert.rejects(store.configure({api:{baseURL}}),{code:'BAD_API_BASE_URL'});
@@ -88,6 +90,7 @@ test('Codex protocol uses isolated homes, verified read-only flags, one turn and
   const thread=mock.requests.find(item=>item.method==='thread/start');assert.equal(thread.params.sandbox,'read-only');assert.equal(thread.params.approvalPolicy,'never');assert.equal(thread.params.ephemeral,true);assert.equal(CODEX_CONFIG['features.shell_tool'],false);
   assert.equal(mock.requests.filter(item=>item.method==='turn/start').length,1);assert.equal(JSON.stringify(mock.requests).includes(fakeKey),false);
   const login=await provider.login(apiConfig);assert.equal(login.authUrl.startsWith('https://auth.openai.com/'),true);assert.equal((await provider.status(apiConfig)).loginPending,true);
+  await provider.close();assert.equal(mock.children[0].stdin.writableEnded,true);assert.equal(mock.children[0].killed,undefined);
 });
 
 test('Codex declines a server approval and kills only its owned child; an unverified protocol version cannot generate',async t=>{

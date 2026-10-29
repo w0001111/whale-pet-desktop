@@ -26,6 +26,12 @@ To the extent the contributors hold rights in these supplied images, they permit
 
 The native application uses system-provided Apple frameworks. Those frameworks are supplied by macOS and are not copied into this source repository. Building and running the application requires a compatible macOS system and the applicable Apple developer tools.
 
+## Windows .NET runtime and installer
+
+The Windows native interface uses WPF and Windows Forms with the Microsoft .NET runtime pinned in `windows-runtime-lock.json`. Self-contained releases preserve the LICENSE and available THIRD-PARTY-NOTICES from the exact restored `Microsoft.NETCore.App.Runtime.win-x64` and `Microsoft.WindowsDesktop.App.Runtime.win-x64` packages under `licenses/`. Those upstream notices govern the redistributed runtime components; the project MIT license does not replace them.
+
+The Windows installer is built with Inno Setup 6.7.4 from its official release, with the tool download SHA-256 pinned in `windows-runtime-lock.json`. Its original license is preserved in the application distribution. The source file `windows/ChineseSimplified.isl` comes from the same upstream release's `Files/Languages/Unofficial/ChineseSimplified.isl`; its translator attribution remains intact. It is a third-party translation, not a project contributor's personal contact. See [Inno Setup source](https://github.com/jrsoftware/issrc/tree/is-6_7_4) for the original files.
+
 ## Release verification
 
 Source-only checkouts do not redistribute the Node.js or Codex executables merely by mentioning them. Binary release publishers must verify the actual packaged runtimes, complete license and notice files, and release manifest before publishing. This notice is an attribution guide; the upstream license texts distributed with each component determine its terms.

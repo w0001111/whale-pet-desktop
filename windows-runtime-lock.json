@@ -1,0 +1,17 @@
+{
+  "nodeVersion": "24.22.2",
+  "codexVersion": "0.164.0",
+  "architecture": "x64",
+  "nodeURL": "https://nodejs.org/dist/v24.22.2/node-v24.22.2-win-x64.zip",
+  "nodeSHA256": "ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2",
+  "codexURL": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0-win32-x64.tgz",
+  "codexIntegrity": "sha512-urWPhwh9YavuoAPIkmVYKBTtd5OtGVL4Ki0Fb28dhK/Mz6Pt4LSy+gbRrZFz5+RXrw9ubvXuXDCcd8beYcWhDg==",
+  "codexLicenseURL": "https://raw.githubusercontent.com/openai/codex/rust-v0.164.0/LICENSE",
+  "codexLicenseSHA256": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc",
+  "codexNoticeURL": "https://raw.githubusercontent.com/openai/codex/rust-v0.164.0/NOTICE",
+  "codexNoticeSHA256": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915",
+  "dotnetSDKVersion": "10.0.403",
+  "dotnetRuntimeVersion": "10.0.14",
+  "innoSetupURL": "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe",
+  "innoSetupSHA256": "a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c"
+}

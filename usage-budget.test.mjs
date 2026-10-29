@@ -1,3 +1,5 @@
+import {directoryLink,privateFileLink,isLinkedFixture} from './test/platform.mjs';
+import {assertPrivateFile} from './test/platform.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -26,7 +28,7 @@ test('fresh files default to unlimited with private modes and an honest coverage
   assert.equal(result.today.requests, 0); assert.equal(result.history.length, 30);
   assert.equal(result.gate.blocked, false); assert.equal(result.gate.remainingTokens, null);
   assert.equal(result.coverage.includesAccountTotal, false); assert.match(result.coverage.note, /本功能启用前/); assert.match(result.coverage.note, /不是硬计费封顶/);
-  assert.equal((await fs.stat(f.policyFile)).mode & 0o777, 0o600); assert.equal((await fs.stat(f.ledgerFile)).mode & 0o777, 0o600);
+  await assertPrivateFile(f.policyFile); await assertPrivateFile(f.ledgerFile);
   assert.deepEqual(await f.budget.snapshot(), result);
 });
 
@@ -217,12 +219,12 @@ test('failed seed persistence is retried on storage recovery without losing the 
 test('symlinked policy or data directory never reads or modifies an outside target', async t => {
   const f = await fixture(t); await f.budget.get();
   const target = path.join(f.root, 'outside-policy.json'); await fs.writeFile(target, JSON.stringify({ dailyTokenLimit: 1 }));
-  await fs.unlink(f.policyFile); await fs.symlink(target, f.policyFile);
+  await fs.unlink(f.policyFile); await privateFileLink(target, f.policyFile);
   assert.equal((await f.budget.proactiveGate()).reason, 'usage_unavailable');
   await assert.rejects(f.budget.configure({ dailyTokenLimit: 10 }), { code: 'USAGE_STORAGE_UNAVAILABLE' });
   assert.equal(await fs.readFile(target, 'utf8'), '{"dailyTokenLimit":1}');
   await fs.unlink(f.policyFile); await fs.rename(path.join(f.root, 'data'), path.join(f.root, 'data.saved'));
-  await fs.symlink(path.join(f.root, 'data.saved'), path.join(f.root, 'data'));
+  await directoryLink(path.join(f.root, 'data.saved'), path.join(f.root, 'data'));
   assert.equal((await f.budget.get()).available, false);
 });
 

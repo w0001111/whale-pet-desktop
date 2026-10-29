@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
+import {storageSecurity} from './private-storage.mjs';
 
 export const COMPANION_TIMEZONE='Asia/Shanghai';
 export const DEFAULT_COMPANION_SETTINGS=Object.freeze({
@@ -90,14 +91,14 @@ export function createCompanionSettings({root,now=Date.now}={}){
     catch(error){if(error.code!=='ENOENT')throw error;}
   }
   async function safeFile(file){
-    try{const info=await fs.lstat(file);if(!info.isFile()||info.isSymbolicLink())throw failure('COMPANION_STORAGE_UNSAFE');}
+    try{const info=await fs.lstat(file);if(!info.isFile()||info.isSymbolicLink()||info.nlink!==1)throw failure('COMPANION_STORAGE_UNSAFE');}
     catch(error){if(error.code!=='ENOENT')throw error;}
   }
   async function read(file,max){
     let handle;
     try{
       await safeDirectory();await safeFile(file);
-      handle=await fs.open(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+      handle=await storageSecurity.openRead(file);
       const stat=await handle.stat();
       if(!stat.isFile()||stat.size>max)throw failure('COMPANION_FILE_TOO_LARGE');
       const data=Buffer.alloc(max+1);let bytes=0;
@@ -109,10 +110,10 @@ export function createCompanionSettings({root,now=Date.now}={}){
   async function write(file,value,max){
     const body=JSON.stringify(value,null,2)+'\n';
     if(Buffer.byteLength(body)>max)throw failure('COMPANION_FILE_TOO_LARGE');
-    await fs.mkdir(directory,{recursive:true,mode:0o700});
+    await storageSecurity.directory(directory);
     await safeDirectory();await safeFile(file);
     const temporary=file+'.'+randomUUID()+'.tmp';
-    try{await fs.writeFile(temporary,body,{flag:'wx',mode:0o600});await fs.rename(temporary,file);}
+    try{await fs.writeFile(temporary,body,{flag:'wx',mode:0o600});await storageSecurity.created(temporary);await fs.rename(temporary,file);storageSecurity.renamed(temporary,file);}
     catch(error){await fs.rm(temporary,{force:true}).catch(()=>{});throw error;}
   }
   const saveSettings=value=>write(settingsFile,{version:1,settings:value},SETTINGS_BYTES);

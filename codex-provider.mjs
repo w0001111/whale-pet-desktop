@@ -3,6 +3,7 @@ import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {fail} from './provider-config.mjs';
 import {emptyUsage} from './api-provider.mjs';
+import {storageSecurity} from './private-storage.mjs';
 
 // Verified against the official 0.164 app-server JSON schema. No ambient
 // credentials, home config, tools, MCP servers or user workspaces are imported.
@@ -16,11 +17,31 @@ export const CODEX_CONFIG=Object.freeze({
   'tools.view_image':false,'tools.web_search':false,'mcp_servers':{},
   'shell_environment_policy.inherit':'none','analytics.enabled':false,
 });
-export async function findCodexBinary(configured=''){
-  if(configured){try{await fs.access(configured,fs.constants.X_OK);return path.resolve(configured);}catch{return null;}}
-  const candidates=[configured,process.env.WHALE_PET_CODEX_BINARY,...(process.env.PATH||'').split(path.delimiter).filter(Boolean).map(folder=>path.join(folder,'codex'))].filter(Boolean);
-  for(const candidate of candidates){try{await fs.access(candidate,fs.constants.X_OK);return path.resolve(candidate);}catch{}}
+export async function findCodexBinary(configured='',{platform=process.platform,env=process.env,io=fs}={}){
+  const paths=platform==='win32'?path.win32:path;
+  const candidates=configured?[configured]:[env.WHALE_PET_CODEX_BINARY,...(env.PATH||env.Path||'').split(paths.delimiter).filter(Boolean).map(folder=>paths.join(folder,platform==='win32'?'codex.exe':'codex'))].filter(Boolean);
+  for(const candidate of candidates){
+    // A .cmd/.bat shim requires a shell; only launch a native executable on Windows.
+    if(platform==='win32'&&!/\.exe$/i.test(candidate))continue;
+    try{await io.access(candidate,platform==='win32'?io.constants.F_OK:io.constants.X_OK);return paths.resolve(candidate);}catch{}
+  }
   return null;
+}
+export function createCodexEnvironment({root,binary,platform=process.platform,env=process.env}={}){
+  const paths=platform==='win32'?path.win32:path,profile=paths.join(root,'codex-system-home'),temporary=paths.join(root,'codex-tmp');
+  const result={PATH:env.PATH||env.Path||(platform==='win32'?'':'/usr/bin:/bin'),HOME:profile,CODEX_HOME:paths.join(root,'codex-home'),TMPDIR:temporary,TEMP:temporary,TMP:temporary,LANG:env.LANG||'en_US.UTF-8'};
+  if(platform==='win32'){
+    const systemRoot=env.SystemRoot||env.SYSTEMROOT||env.WINDIR||'C:\\Windows';
+    Object.assign(result,{USERPROFILE:profile,APPDATA:paths.join(profile,'Roaming'),LOCALAPPDATA:paths.join(profile,'Local'),SystemRoot:systemRoot,WINDIR:systemRoot});
+    result.PATH=[binary?paths.dirname(binary):'',paths.join(systemRoot,'System32'),result.PATH].filter(Boolean).join(';');
+  }
+  for(const key of ['HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','NO_PROXY'])if(env[key])result[key]=env[key];
+  return result;
+}
+export function sameCodexHome(left,right,{platform=process.platform}={}){
+  if(typeof left!=='string'||typeof right!=='string')return false;
+  if(platform==='win32')return path.win32.resolve(left.replace(/^\\\\\?\\/,'' )).toLowerCase()===path.win32.resolve(right.replace(/^\\\\\?\\/,'')).toLowerCase();
+  return path.resolve(left)===path.resolve(right);
 }
 export function createCodexProvider({root,spawnImpl=spawn,findBinary=findCodexBinary}={}){
   const home=path.join(root,'codex-home'),workspace=path.join(root,'codex-workspace'),systemHome=path.join(root,'codex-system-home');
@@ -32,7 +53,16 @@ export function createCodexProvider({root,spawnImpl=spawn,findBinary=findCodexBi
     return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(id);reject(fail('CODEX_RPC_TIMEOUT'));},timeoutMs);pending.set(id,{resolve,reject,timer});try{send({id,method,params});}catch(error){clearTimeout(timer);pending.delete(id);reject(error);}});
   }
   function rejectAll(){ready=false;restrictedModeVerified=false;for(const value of pending.values()){clearTimeout(value.timer);value.reject(fail('CODEX_DISCONNECTED'));}pending.clear();active?.reject(fail('CODEX_DISCONNECTED'));}
-  function stopChild(){ready=false;restrictedModeVerified=false;if(child){const owned=child;child=null;owned.kill?.('SIGTERM');}rejectAll();}
+  function stopChild(){ready=false;restrictedModeVerified=false;if(child){const owned=child;child=null;owned.kill?.('SIGKILL');}rejectAll();}
+  async function closeChild(){
+    const owned=child;if(!owned){rejectAll();return;}
+    child=null;rejectAll();
+    // Closing the owned app-server's input is the portable graceful path.
+    // Windows kill(SIGTERM) is forceful, so use a bounded hard-stop only after EOF.
+    let timer;const ended=new Promise(resolve=>{const finish=()=>{clearTimeout(timer);resolve();};owned.once('exit',finish);owned.once('error',finish);timer=setTimeout(()=>{owned.kill?.('SIGKILL');finish();},2000);});
+    try{owned.stdin.end();}catch{owned.kill?.('SIGKILL');}
+    await ended;
+  }
   function deny(message){
     let result;
     if(message.method.includes('requestApproval')&&(message.method.includes('commandExecution')||message.method.includes('fileChange')))result={decision:'decline'};
@@ -63,25 +93,24 @@ export function createCodexProvider({root,spawnImpl=spawn,findBinary=findCodexBi
     if(initializing)return initializing;
     initializing=(async()=>{
       const binary=await findBinary(config.codex.cliPath);if(!binary)throw fail('CODEX_CLI_MISSING');
-      for(const folder of [home,workspace,systemHome,path.join(root,'codex-tmp')]){await fs.mkdir(folder,{recursive:true,mode:0o700});const info=await fs.lstat(folder);if(!info.isDirectory()||info.isSymbolicLink())throw fail('UNSAFE_STORAGE');}
-      for(const name of ['auth.json','config.toml','requirements.toml']){try{const info=await fs.lstat(path.join(home,name));if(!info.isFile()||info.isSymbolicLink())throw fail('UNSAFE_STORAGE');}catch(error){if(error.code!=='ENOENT')throw error;}}
+      for(const folder of [home,workspace,systemHome,path.join(root,'codex-tmp'),path.join(systemHome,'Roaming'),path.join(systemHome,'Local')])await storageSecurity.directory(folder);
+      for(const name of ['auth.json','config.toml','requirements.toml']){try{await storageSecurity.protectExisting(path.join(home,name));}catch(error){if(error.code!=='ENOENT')throw error;}}
       const args=['app-server','--listen','stdio://',...Object.entries(CODEX_CONFIG).flatMap(([key,value])=>['-c',`${key}=${JSON.stringify(value)}`])];
-      const env={PATH:process.env.PATH||'/usr/bin:/bin',HOME:systemHome,CODEX_HOME:home,TMPDIR:path.join(root,'codex-tmp'),LANG:process.env.LANG||'en_US.UTF-8'};
-      for(const key of ['HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','NO_PROXY'])if(process.env[key])env[key]=process.env[key];
-      child=spawnImpl(binary,args,{cwd:workspace,env,stdio:['pipe','pipe','pipe']});buffer='';
+      const env=createCodexEnvironment({root,binary});
+      child=spawnImpl(binary,args,{cwd:workspace,env,stdio:['pipe','pipe','pipe'],windowsHide:true});buffer='';
       const owned=child;
       const decoder=new TextDecoder();
       child.stdout.on('data',chunk=>{buffer+=decoder.decode(chunk,{stream:true});if(Buffer.byteLength(buffer)>2*1024*1024){stopChild();return;}while(buffer.includes('\n')){const index=buffer.indexOf('\n'),line=buffer.slice(0,index);buffer=buffer.slice(index+1);try{receive(JSON.parse(line));}catch{stopChild();return;}}});
       child.stderr.on('data',()=>{}); // Provider/auth errors must never enter logs.
       child.on('error',()=>{if(child===owned)rejectAll();});child.on('exit',()=>{if(child===owned){child=null;rejectAll();}});
-      const initialized=await request('initialize',{clientInfo:{name:'whale_pet_desktop',version:'0.1.0'}});
+      const initialized=await request('initialize',{clientInfo:{name:'whale_pet_desktop',version:'0.2.0'}});
       send({method:'initialized'});
       const version=initialized?.userAgent?.match(/\/(\d+\.\d+\.\d+)/)?.[1];
       const effective=await request('config/read',{includeLayers:false});
       // ConfigReadResponse.ToolsV2 projects only web_search in 0.164, so it
       // cannot echo view_image. That documented option is always passed above;
       // verify every observable restriction, but never claim a no-tools table.
-      restrictedModeVerified=/^0\.164\.\d+$/.test(version||'')&&initialized.codexHome===home&&effective?.config?.features?.shell_tool===false&&['apps','multi_agent','browser_use','computer_use','remote_plugin','tool_suggest'].every(key=>effective.config.features[key]===false)&&effective.config.web_search==='disabled'&&effective.config.project_doc_max_bytes===0&&Object.keys(effective.config.mcp_servers||{}).length===0&&effective.config.sandbox_mode==='read-only'&&effective.config.approval_policy==='never';
+      restrictedModeVerified=/^0\.164\.\d+$/.test(version||'')&&sameCodexHome(initialized.codexHome,home)&&effective?.config?.features?.shell_tool===false&&['apps','multi_agent','browser_use','computer_use','remote_plugin','tool_suggest'].every(key=>effective.config.features[key]===false)&&effective.config.web_search==='disabled'&&effective.config.project_doc_max_bytes===0&&Object.keys(effective.config.mcp_servers||{}).length===0&&effective.config.sandbox_mode==='read-only'&&effective.config.approval_policy==='never';
       ready=true;
     })();
     try{await initializing;}catch(error){stopChild();throw error;}finally{initializing=null;}
@@ -115,6 +144,6 @@ export function createCodexProvider({root,spawnImpl=spawn,findBinary=findCodexBi
         return{text:result.text.trim().slice(0,16000),model:config.model||'codex-default',source:'codex',usage,usageIncomplete:!raw,usageScope:'codex-thread-reported',modelCalls:1,modelCallsAreTurns:true,toolCalls:0};
       }finally{cleanup?.();active=null;}
     },
-    async close(){stopChild();},
+    async close(){await closeChild();},
   };
 }

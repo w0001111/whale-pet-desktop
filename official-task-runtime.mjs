@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { AGENT_LIMITS, AGENT_TOOLS, createReadOnlyWebTools, publicWebUrl } from './web-tools.mjs';
+import {privateRead,privateWrite} from './provider-config.mjs';
+import {storageSecurity} from './private-storage.mjs';
 
 const terminal = new Set(['completed','failed','stopped','budget_exhausted','interrupted']);
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
@@ -22,11 +24,12 @@ export function createOfficialTaskRuntime({root,runAgent,executeTool=createReadO
   async function persist(task,event) {
     const value=copy(task);
     const write=writes.then(async()=>{
-      await fs.mkdir(directory,{recursive:true,mode:0o700});
-      if(event)await fs.appendFile(path.join(directory,task.id+'.jsonl'),JSON.stringify(event)+'\n',{mode:0o600});
-      const temporary=path.join(directory,'.'+task.id+'.'+randomUUID()+'.tmp');
-      await fs.writeFile(temporary,JSON.stringify(value,null,2)+'\n',{mode:0o600,flag:'wx'});
-      await fs.rename(temporary,path.join(directory,task.id+'.json'));
+      await storageSecurity.directory(directory);
+      if(event){
+        const handle=await storageSecurity.openAppend(path.join(directory,task.id+'.jsonl'));
+        try{const text=JSON.stringify(event)+'\n';if((await handle.stat()).size+Buffer.byteLength(text)>2*1024*1024)throw new Error('TASK_LOG_LIMIT');await handle.writeFile(text);}finally{await handle.close();}
+      }
+      await privateWrite(path.join(directory,task.id+'.json'),value,512000);
     });
     writes=write.catch(()=>{});try{await write;}catch{throw Object.assign(new Error('STORAGE_FAILED'),{code:'STORAGE_FAILED'});}
   }
@@ -43,7 +46,7 @@ export function createOfficialTaskRuntime({root,runAgent,executeTool=createReadO
   async function load(id) {
     if(!uuid.test(id||''))throw Object.assign(new Error('TASK_NOT_FOUND'),{code:'TASK_NOT_FOUND'});
     if(tasks.has(id))return tasks.get(id);
-    let task;try{const content=await fs.readFile(path.join(directory,id+'.json'),'utf8');if(content.length>512000)throw new Error();task=JSON.parse(content);}catch{throw Object.assign(new Error('TASK_NOT_FOUND'),{code:'TASK_NOT_FOUND'});}
+    let task;try{task=await privateRead(path.join(directory,id+'.json'),512000);if(!task)throw new Error();}catch{throw Object.assign(new Error('TASK_NOT_FOUND'),{code:'TASK_NOT_FOUND'});}
     if(task.id!==id)throw Object.assign(new Error('TASK_NOT_FOUND'),{code:'TASK_NOT_FOUND'});
     if(!terminal.has(task.status)){task.status='interrupted';task.finishedAt=new Date().toISOString();task.updatedAt=task.finishedAt;task.error={code:'SERVICE_RESTARTED',message:'上次运行被中断，没有自动继续。'};await persist(task);}
     tasks.set(id,task);return task;

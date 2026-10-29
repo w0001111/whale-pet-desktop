@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { appDataRoot } from './provider-config.mjs';
+import {storageSecurity} from './private-storage.mjs';
 
 export const SCREEN_INTERVAL_SECONDS = 600;
 export const SCREEN_DAILY_LIMIT = 12;
@@ -34,16 +35,19 @@ function validDay(value) {
 async function readJSON(file) {
   const info = await fs.lstat(file);
   if (!info.isFile() || info.isSymbolicLink() || info.size > 8192) throw fail('INVALID_SCREEN_STORAGE');
-  return JSON.parse(await fs.readFile(file, 'utf8'));
+  const handle=await storageSecurity.openRead(file);
+  try{const bytes=Buffer.alloc(8193);let count=0;while(count<bytes.length){const result=await handle.read(bytes,count,bytes.length-count,count);if(!result.bytesRead)break;count+=result.bytesRead;}if(count>8192)throw fail('INVALID_SCREEN_STORAGE');return JSON.parse(bytes.subarray(0,count).toString('utf8'));}finally{await handle.close();}
 }
 
 async function writeJSON(file, value) {
-  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await storageSecurity.directory(path.dirname(file));
+  try{const info=await fs.lstat(file);if(!info.isFile()||info.isSymbolicLink())throw fail('INVALID_SCREEN_STORAGE');}catch(error){if(error.code!=='ENOENT')throw error;}
   const temporary = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   try {
     await fs.writeFile(temporary, JSON.stringify(value) + '\n', { mode: 0o600, flag: 'wx' });
+    await storageSecurity.created(temporary);
     await fs.rename(temporary, file);
-    await fs.chmod(file, 0o600);
+    storageSecurity.renamed(temporary,file);
   } finally { await fs.unlink(temporary).catch(() => {}); }
 }
 

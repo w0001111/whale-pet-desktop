@@ -42,6 +42,10 @@ __pycache__/
 *.swiftmodule
 *.swiftdoc
 *.swiftsourceinfo
+windows/bin/
+windows/obj/
+*.pdb
+*.user
 
 # Local signing material and editor state.
 *.p12

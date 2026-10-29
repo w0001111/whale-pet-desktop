@@ -1,3 +1,6 @@
+import {directoryLink,privateFileLink,isLinkedFixture} from './test/platform.mjs';
+import {assertPrivateFile} from './test/platform.mjs';
+import os from 'node:os';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -5,7 +8,7 @@ import path from 'node:path';
 import {createCompanionSettings,DEFAULT_COMPANION_SETTINGS,COMPANION_TIMEZONE,parseCompanionCommand} from './companion-settings.mjs';
 
 async function fixture(t,{now=()=>Date.parse('2026-10-29T04:00:00.000Z')}={}){
-  const root=await fs.mkdtemp('/private/tmp/whale-companion-settings-');
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'whale-companion-settings-'));
   t.after(()=>fs.rm(root,{recursive:true,force:true}));
   return{root,store:createCompanionSettings({root,now}),file:name=>path.join(root,'data',name)};
 }
@@ -15,7 +18,7 @@ test('missing files establish conservative defaults and independent private atom
   assert.deepEqual(await store.get(),DEFAULT_COMPANION_SETTINGS);
   assert.equal(COMPANION_TIMEZONE,'Asia/Shanghai');
   assert.deepEqual(await store.recentContext(),[]);
-  for(const name of ['companion-settings.json','companion-recent.json'])assert.equal((await fs.stat(file(name))).mode&0o777,0o600);
+  for(const name of ['companion-settings.json','companion-recent.json'])await assertPrivateFile(file(name));
   const prefs=await store.get();prefs.preferences.preferredName='external mutation';
   assert.equal((await store.get()).preferences.preferredName,'你');
   assert.deepEqual((await fs.readdir(path.dirname(file('x')))).sort(),['companion-recent.json','companion-settings.json']);
@@ -57,19 +60,19 @@ test('a valid older partial settings object migrates while invalid or oversized 
 });
 
 test('linked data directories and linked private records are rejected without reading or replacing their targets',async t=>{
-  const outside=await fs.mkdtemp('/private/tmp/whale-companion-link-target-');
+  const outside=await fs.mkdtemp(path.join(os.tmpdir(),'whale-companion-link-target-'));
   t.after(()=>fs.rm(outside,{recursive:true,force:true}));
   const target=path.join(outside,'private.json'),bytes='DO_NOT_READ_OR_REPLACE_LINK_TARGET';
   await fs.writeFile(target,bytes);
-  const directoryLink=await fixture(t);
-  await fs.symlink(outside,path.join(directoryLink.root,'data'));
-  await assert.rejects(directoryLink.store.get(),{code:'COMPANION_STORAGE_UNSAFE'});
-  assert.equal((await fs.lstat(path.join(directoryLink.root,'data'))).isSymbolicLink(),true);
+  const linkedDirectory=await fixture(t);
+  await directoryLink(outside,path.join(linkedDirectory.root,'data'));
+  await assert.rejects(linkedDirectory.store.get(),{code:'COMPANION_STORAGE_UNSAFE'});
+  assert.equal((await fs.lstat(path.join(linkedDirectory.root,'data'))).isSymbolicLink(),true);
   for(const name of ['companion-settings.json','companion-recent.json']){
     const linked=await fixture(t);await fs.mkdir(path.join(linked.root,'data'));
-    await fs.symlink(target,linked.file(name));
+    await privateFileLink(target,linked.file(name));
     await assert.rejects(linked.store.get(),{code:'COMPANION_STORAGE_UNSAFE'});
-    assert.equal((await fs.lstat(linked.file(name))).isSymbolicLink(),true);
+    assert.equal(await isLinkedFixture(linked.file(name)),true);
   }
   assert.equal(await fs.readFile(target,'utf8'),bytes);
 });

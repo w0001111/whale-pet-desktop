@@ -7,4 +7,3 @@
 *.webp binary
 *.dmg binary
 *.zip binary
-.github/ export-ignore

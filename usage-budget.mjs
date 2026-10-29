@@ -1,8 +1,8 @@
 import fs from 'node:fs/promises';
-import { constants } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { shanghaiDay } from './screen-policy.mjs';
+import {storageSecurity} from './private-storage.mjs';
 
 const DAY_MS = 86_400_000;
 const RETENTION_DAYS = 30;
@@ -94,16 +94,19 @@ export function createUsageBudget({ root, now = () => Date.now() } = {}) {
   async function checkDirectory() {
     const rootInfo = await fs.lstat(root);
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw fail('UNSAFE_USAGE_STORAGE');
-    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    await storageSecurity.directory(directory);
     const info = await fs.lstat(directory);
     if (!info.isDirectory() || info.isSymbolicLink()) throw fail('UNSAFE_USAGE_STORAGE');
   }
   async function read(file, limit) {
-    const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const handle = await storageSecurity.openRead(file);
     try {
       const info = await handle.stat();
       if (!info.isFile() || info.size > limit) throw fail('INVALID_USAGE_STORAGE');
-      return JSON.parse(await handle.readFile('utf8'));
+      const bytes=Buffer.alloc(limit+1);let count=0;
+      while(count<bytes.length){const result=await handle.read(bytes,count,bytes.length-count,count);if(!result.bytesRead)break;count+=result.bytesRead;}
+      if(count>limit)throw fail('INVALID_USAGE_STORAGE');
+      return JSON.parse(bytes.subarray(0,count).toString('utf8'));
     } finally { await handle.close(); }
   }
   async function write(file, value, limit) {
@@ -116,7 +119,9 @@ export function createUsageBudget({ root, now = () => Date.now() } = {}) {
       const temporary = `${file}.${randomUUID()}.tmp`;
       try {
         await fs.writeFile(temporary, bytes, { flag: 'wx', mode: 0o600 });
+        await storageSecurity.created(temporary);
         await fs.rename(temporary, file);
+        storageSecurity.renamed(temporary,file);
       } finally { await fs.unlink(temporary).catch(() => {}); }
       if (file === policyFile) retryPolicyWrite = false;
       else retryLedgerWrite = false;

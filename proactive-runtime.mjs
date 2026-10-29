@@ -1,7 +1,7 @@
-import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { shanghaiDay } from './screen-policy.mjs';
+import {privateRead,privateWrite} from './provider-config.mjs';
 
 export const DEFAULT_PROACTIVE_POLICY = Object.freeze({ enabled: false, mode: 'economy', minIntervalSeconds: 60, maxIntervalSeconds: 600, dailyAiLimit: 24 });
 const HEARTBEAT_MS = 60_000;
@@ -132,25 +132,16 @@ export function createProactiveRuntime({ root, generate, canRun = () => true, ge
   }
 
   async function persist() {
-    const directory = path.dirname(file);
-    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-    const info = await fs.lstat(directory);
-    if (!info.isDirectory() || info.isSymbolicLink()) throw fail('PROACTIVE_STORAGE_UNSAFE');
-    const temporary = `${file}.${randomUUID()}.tmp`;
     state.updatedAt = iso(now());
     try {
-      await fs.writeFile(temporary, JSON.stringify(state, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
-      await fs.rename(temporary, file);
-      await fs.chmod(file, 0o600);
+      await privateWrite(file,state,2*1024*1024);
     } catch { throw fail('PROACTIVE_STORAGE_FAILED'); }
-    finally { await fs.unlink(temporary).catch(() => {}); }
   }
   async function load() {
     if (state) return;
     try {
-      const info = await fs.lstat(file);
-      if (!info.isFile() || info.isSymbolicLink() || info.size > 2 * 1024 * 1024) throw fail('PROACTIVE_STORAGE_UNSAFE');
-      const value = JSON.parse(await fs.readFile(file, 'utf8'));
+      const value=await privateRead(file,2*1024*1024);
+      if(value===undefined)throw Object.assign(new Error('ENOENT'),{code:'ENOENT'});
       const policy = validateProactivePolicy(value.policy);
       if (value.version !== 1 || !/^\d{4}-\d{2}-\d{2}$/.test(value.day) ||
           !['aiAttempts', 'aiSucceeded', 'localSent'].every(key => Number.isSafeInteger(value[key]) && value[key] >= 0) ||

@@ -1,8 +1,8 @@
 {
   "name": "whale-pet-desktop",
-  "version": "0.1.0",
+  "version": "0.2.0-windows.1",
   "private": true,
-  "description": "A local-first macOS whale companion with optional Codex or compatible API chat",
+  "description": "A local-first macOS and Windows whale companion with optional Codex or compatible API chat",
   "license": "MIT",
   "type": "module",
   "engines": {"node": ">=24"},

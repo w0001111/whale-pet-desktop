@@ -2,8 +2,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import {randomUUID} from 'node:crypto';
+import {storageSecurity} from './private-storage.mjs';
 
-export const appDataRoot=()=>path.resolve(process.env.WHALE_PET_DATA_DIR||path.join(os.homedir(),'Library','Application Support','WhalePet'));
+export function appDataRoot({platform=process.platform,env=process.env,home=os.homedir()}={}){
+  const paths=platform==='win32'?path.win32:path;
+  return paths.resolve(env.WHALE_PET_DATA_DIR||(platform==='win32'?paths.join(env.LOCALAPPDATA||paths.join(home,'AppData','Local'),'WhalePet'):paths.join(home,'Library','Application Support','WhalePet')));
+}
 export const fail=code=>Object.assign(new Error(code),{code});
 export const DEFAULT_PROVIDER_CONFIG=Object.freeze({mode:'none',model:'',api:{format:'responses',baseURL:'https://api.openai.com/v1',apiKey:''},codex:{cliPath:''}});
 const plain=value=>value!==null&&typeof value==='object'&&!Array.isArray(value)&&[Object.prototype,null].includes(Object.getPrototypeOf(value));
@@ -21,19 +25,19 @@ export async function privateRead(file,max=128*1024){
   try{
     const parent=await fs.lstat(path.dirname(file));if(!parent.isDirectory()||parent.isSymbolicLink())throw fail('UNSAFE_STORAGE');
     const info=await fs.lstat(file);if(!info.isFile()||info.isSymbolicLink())throw fail('UNSAFE_STORAGE');
-    handle=await fs.open(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);if((await handle.stat()).size>max)throw fail('STATE_TOO_LARGE');
+    handle=await storageSecurity.openRead(file);if((await handle.stat()).size>max)throw fail('STATE_TOO_LARGE');
     const data=Buffer.alloc(max+1);let count=0;while(count<data.length){const read=await handle.read(data,count,data.length-count,count);if(!read.bytesRead)break;count+=read.bytesRead;}
     if(count>max)throw fail('STATE_TOO_LARGE');
     let value;try{value=JSON.parse(data.subarray(0,count).toString('utf8'));}catch{throw fail('STATE_INVALID');}
-    await handle.chmod(0o600);return value;
+    return value;
   }catch(error){if(error.code==='ENOENT')return undefined;throw error;}finally{await handle?.close();}
 }
 export async function privateWrite(file,value,max=128*1024){
   const body=JSON.stringify(value,null,2)+'\n';if(Buffer.byteLength(body)>max)throw fail('STATE_TOO_LARGE');
-  await fs.mkdir(path.dirname(file),{recursive:true,mode:0o700});const parent=await fs.lstat(path.dirname(file));if(!parent.isDirectory()||parent.isSymbolicLink())throw fail('UNSAFE_STORAGE');
+  await storageSecurity.directory(path.dirname(file));
   try{const info=await fs.lstat(file);if(!info.isFile()||info.isSymbolicLink())throw fail('UNSAFE_STORAGE');}catch(error){if(error.code!=='ENOENT')throw error;}
   const temporary=file+'.'+randomUUID()+'.tmp';
-  try{await fs.writeFile(temporary,body,{mode:0o600,flag:'wx'});await fs.rename(temporary,file);}catch(error){await fs.rm(temporary,{force:true}).catch(()=>{});throw error;}
+  try{await fs.writeFile(temporary,body,{mode:0o600,flag:'wx'});await storageSecurity.created(temporary);await fs.rename(temporary,file);storageSecurity.renamed(temporary,file);}catch(error){await fs.rm(temporary,{force:true}).catch(()=>{});throw error;}
 }
 function validate(value){
   if(!keys(value,['mode','model','api','codex'])||!['none','codex','api'].includes(value.mode)||typeof value.model!=='string'||value.model.length>120||/[\r\n\u0000]/.test(value.model)||

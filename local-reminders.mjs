@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
+import {storageSecurity} from './private-storage.mjs';
 
 const DAY=86_400_000,MAX_FUTURE=365*DAY,MAX_BYTES=2*1024*1024,MAX_ITEMS=500;
 const UUID=/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
@@ -97,26 +98,26 @@ export function createLocalReminders({root,now=Date.now,schedule=(callback,delay
   const clock=()=>currentTime(now);
   function serial(operation){const pending=queue.then(async()=>{if(closed)throw failure('REMINDERS_CLOSED');await initialize();return operation();});queue=pending.catch(()=>{});return pending;}
   async function safeDirectory(){try{const info=await fs.lstat(directory);if(!info.isDirectory()||info.isSymbolicLink())throw failure('REMINDER_STORAGE_UNSAFE');}catch(error){if(error.code!=='ENOENT')throw error;}}
-  async function safeFile(){try{const info=await fs.lstat(file);if(!info.isFile()||info.isSymbolicLink())throw failure('REMINDER_STORAGE_UNSAFE');}catch(error){if(error.code!=='ENOENT')throw error;}}
+  async function safeFile(){try{const info=await fs.lstat(file);if(!info.isFile()||info.isSymbolicLink()||info.nlink!==1)throw failure('REMINDER_STORAGE_UNSAFE');}catch(error){if(error.code!=='ENOENT')throw error;}}
   async function load(){
     let handle;
     try{
-      await safeDirectory();await safeFile();handle=await fs.open(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+      await safeDirectory();await safeFile();handle=await storageSecurity.openRead(file);
       const info=await handle.stat();if(!info.isFile())throw failure('REMINDER_STORAGE_UNSAFE');if(info.size>MAX_BYTES)throw failure('REMINDER_FILE_TOO_LARGE');
       const bytes=Buffer.alloc(MAX_BYTES+1);let count=0;
       while(count<bytes.length){const read=await handle.read(bytes,count,bytes.length-count,count);if(!read.bytesRead)break;count+=read.bytesRead;}
       if(count>MAX_BYTES)throw failure('REMINDER_FILE_TOO_LARGE');
       let value;try{value=JSON.parse(bytes.subarray(0,count).toString('utf8'));}catch{throw failure('REMINDER_STATE_INVALID');}
-      validate(value);await handle.chmod(0o600);return value;
+      validate(value);return value;
     }catch(error){if(error.code==='ENOENT')return undefined;throw error;}finally{await handle?.close();}
   }
   async function persist(value){
     validate(value);const body=JSON.stringify(value)+'\n';if(Buffer.byteLength(body)>MAX_BYTES)throw failure('REMINDER_FILE_TOO_LARGE');
-    await fs.mkdir(directory,{recursive:true,mode:0o700});await safeDirectory();await safeFile();
+    await storageSecurity.directory(directory);await safeDirectory();await safeFile();
     const temporary=file+'.'+randomUUID()+'.tmp';let handle;
     try{
       handle=await fs.open(temporary,'wx',0o600);await handle.writeFile(body);await handle.sync();await handle.close();handle=null;
-      await fs.rename(temporary,file);
+      await storageSecurity.created(temporary);await fs.rename(temporary,file);storageSecurity.renamed(temporary,file);
     }catch(error){await handle?.close().catch(()=>{});await fs.rm(temporary,{force:true}).catch(()=>{});throw error;}
   }
   async function initialize(){

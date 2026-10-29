@@ -1,3 +1,6 @@
+import {directoryLink,privateFileLink,isLinkedFixture} from './test/platform.mjs';
+import {assertPrivateFile} from './test/platform.mjs';
+import os from 'node:os';
 import test,{mock} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -15,7 +18,7 @@ class Clock{
   async advance(milliseconds){this.at+=milliseconds;for(let n=0;n<1000;n++){const job=this.next();if(!job||job.due>this.at)return;await this.fire(job);}throw new Error('Timer loop did not settle');}
 }
 async function fixture(t,{clock=new Clock()}={}){
-  const root=await fs.mkdtemp('/private/tmp/whale-local-reminders-');
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'whale-local-reminders-'));
   const store=createLocalReminders({root,now:clock.now,schedule:clock.schedule});
   t.after(async()=>{await store.close();await fs.rm(root,{recursive:true,force:true});});
   return{root,store,clock,file:path.join(root,'data','local-reminders.json')};
@@ -54,7 +57,7 @@ test('quotes, narration, multiline or mixed operational requests cannot create r
 test('state defaults are private, immutable to callers and independent of companion quiet or focus',async t=>{
   const {store,file,clock}=await fixture(t);
   assert.deepEqual(await store.start(),{reminders:[],todos:[],settings:{defaultMorningTime:'09:00',timezone:'Asia/Shanghai'}});
-  assert.equal((await fs.stat(file)).mode&0o777,0o600);
+  await assertPrivateFile(file);
   assert.deepEqual(await store.configure({defaultMorningTime:'07:45'}),{defaultMorningTime:'07:45',timezone:'Asia/Shanghai'});
   const snapshot=await store.list();snapshot.settings.defaultMorningTime='00:00';assert.equal((await store.list()).settings.defaultMorningTime,'07:45');
   for(const patch of [{defaultMorningTime:'8:30'},{defaultMorningTime:'25:00'},{defaultMorningTime:'09:00',timezone:'UTC'},{quiet:{enabled:true}}])await assert.rejects(store.configure(patch),{code:'BAD_REMINDER_SETTINGS'});
@@ -164,12 +167,12 @@ test('invalid time, snooze, text and identifiers are rejected without changing v
 });
 
 test('linked directories/files, malformed state and oversized state are preserved and rejected',async t=>{
-  const outside=await fs.mkdtemp('/private/tmp/whale-reminder-link-target-');t.after(()=>fs.rm(outside,{recursive:true,force:true}));
+  const outside=await fs.mkdtemp(path.join(os.tmpdir(),'whale-reminder-link-target-'));t.after(()=>fs.rm(outside,{recursive:true,force:true}));
   const target=path.join(outside,'private.json'),secret='DO_NOT_READ_OR_REPLACE';await fs.writeFile(target,secret);
-  const directoryLink=await fixture(t);await fs.symlink(outside,path.join(directoryLink.root,'data'));
-  await assert.rejects(directoryLink.store.list(),{code:'REMINDER_STORAGE_UNSAFE'});assert.equal((await fs.lstat(path.join(directoryLink.root,'data'))).isSymbolicLink(),true);
-  const fileLink=await fixture(t);await fs.mkdir(path.dirname(fileLink.file));await fs.symlink(target,fileLink.file);
-  await assert.rejects(fileLink.store.list(),{code:'REMINDER_STORAGE_UNSAFE'});assert.equal((await fs.lstat(fileLink.file)).isSymbolicLink(),true);assert.equal(await fs.readFile(target,'utf8'),secret);
+  const linkedDirectory=await fixture(t);await directoryLink(outside,path.join(linkedDirectory.root,'data'));
+  await assert.rejects(linkedDirectory.store.list(),{code:'REMINDER_STORAGE_UNSAFE'});assert.equal((await fs.lstat(path.join(linkedDirectory.root,'data'))).isSymbolicLink(),true);
+  const fileLink=await fixture(t);await fs.mkdir(path.dirname(fileLink.file));await privateFileLink(target,fileLink.file);
+  await assert.rejects(fileLink.store.list(),{code:'REMINDER_STORAGE_UNSAFE'});assert.equal(await isLinkedFixture(fileLink.file),true);assert.equal(await fs.readFile(target,'utf8'),secret);
   const invalid=await fixture(t);await fs.mkdir(path.dirname(invalid.file));await fs.writeFile(invalid.file,'null');
   await assert.rejects(invalid.store.list(),{code:'REMINDER_STATE_INVALID'});assert.equal(await fs.readFile(invalid.file,'utf8'),'null');
   const large=await fixture(t);await fs.mkdir(path.dirname(large.file));await fs.writeFile(large.file,' '.repeat(2*1024*1024+1));

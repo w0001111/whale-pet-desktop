@@ -1,3 +1,4 @@
+import {assertPrivateFile} from './test/platform.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -29,8 +30,8 @@ test('absent settings keep old defaults; configured policy and dispatch counters
   assert.equal(status.remaining, 24);
   assert.equal(status.minIntervalSeconds, 120);
   assert.equal(status.reason, 'cooldown');
-  assert.equal((await fs.stat(f.policyFile)).mode & 0o777, 0o600);
-  assert.equal((await fs.stat(f.file)).mode & 0o777, 0o600);
+  await assertPrivateFile(f.policyFile);
+  await assertPrivateFile(f.file);
 });
 
 test('lowering then raising daily limit never resets usage or invalidates a legacy ledger over the new cap', async t => {

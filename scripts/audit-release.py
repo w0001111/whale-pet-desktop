@@ -197,6 +197,8 @@ class Audit:
                 name = f"{label}/{relative}"
                 if source and folder == root and item.name in {".cache", "build", "dist", ".git"}:
                     continue  # Explicit source-export allowlist, never artifacts.
+                if source and relative in {"windows/bin", "windows/obj"}:
+                    continue  # Explicit .NET compiler/cache outputs, never source or release inputs.
                 if item.name == ".git" and not packaged:
                     continue  # Release packages must not contain repository metadata.
                 if self.forbidden(name, item.is_dir(), packaged):
@@ -300,7 +302,7 @@ def self_test():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("targets", nargs="*", help="Source directory, built .app, actual .zip and/or .dmg; all are inspected.")
-    parser.add_argument("--source", action="append", default=[], metavar="DIR", help="Audit a source-export root excluding only top-level .cache/build/dist/.git. Actual artifacts are still passed as positional targets and inspected fully.")
+    parser.add_argument("--source", action="append", default=[], metavar="DIR", help="Audit source excluding explicit .cache/build/dist/.git and windows/bin/obj compiler output. Actual artifacts are fully inspected.")
     parser.add_argument("--json", action="store_true", help="Emit only path/line/category objects and counts.")
     parser.add_argument("--self-test", action="store_true")
     options = parser.parse_args()

@@ -1,3 +1,4 @@
+import {assertPrivateFile} from './test/platform.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -83,7 +84,7 @@ test('screen ledger persists cooldown, caps Shanghai calendar days, and resets a
     await budget.commit();
     assert.equal((await budget.status()).remaining,11);
     assert.equal((await budget.status()).reason,'cooldown');
-    assert.equal((await fs.stat(file)).mode&0o777,0o600);
+    await assertPrivateFile(file);
     assert.equal((await createScreenBudget({file,now:()=>now}).status()).used,1);
     for(let n=1;n<12;n++){now+=600_000;await budget.commit();}
     assert.equal((await budget.status()).remaining,0);

@@ -1,12 +1,16 @@
 # Whale Pet · 大肥鱼桌宠
 
-一只可以离线住在 Mac 桌面上的蓝色大肥鱼。拖一拖、挥个手，让它在二维桌面范围内散步；需要聊天时，再连接你自己的 AI。
+一只可以离线住在桌面上的蓝色大肥鱼。拖一拖、挥个手，让它在二维桌面范围内散步；需要聊天时，再连接你自己的 AI。提供 macOS 原生稳定版，以及 Windows 原生测试版。
 
 <img src="assets/pet.png" width="180" alt="蓝色大肥鱼角色素材">
 
 Whale Pet 是独立开源项目，与 OpenAI、DeepSeek 及其他模型服务商没有官方隶属关系。使用发行包不需要安装 DeepSeek Harness、Node、npm 或其他开发环境。
 
 ## 下载与安装
+
+**Windows 11 x64** 使用 [Windows 测试版发行页](../../releases/tag/v0.2.0-windows.1)，下载 `*-setup.exe` 安装，或完整解压 `*-portable.zip` 后打开 `WhalePet.exe`。运行环境已内置，无需安装 Node、.NET、WSL 或 Harness。安装与首次配置见 [Windows 中文安装指南](docs/INSTALL.windows.zh-CN.md)。Windows 首版尚未提供屏幕截图和前台应用信息；未签名，系统可能显示未知发布者或 SmartScreen 提示。以发行页实际提供的资产与验收报告为准。
+
+以下为 **macOS 稳定版 v0.1.0** 的安装说明：
 
 需要 **macOS 15 或更新版本**。请从本仓库右侧的 **Releases**，或[最新发行版页面](../../releases/latest)选择与你的 Mac 匹配的包。若页面尚未提供资产，请等待该版本发布，或按下面的源码构建说明操作。
 
@@ -55,11 +59,19 @@ API 的模型权限、价格和费用由你选择的服务决定。Codex 的可�
 - **主动 AI 默认关闭**：需要你自行开启。开启后的 AI 生成会消耗额度，不会主动截图。
 - **不复制旧账号与用户数据**：发行包不包含维护者账号、聊天、记忆、截图或其他使用者的数据。
 
-默认用户目录为 `~/Library/Application Support/WhalePet`，其中 `data/` 保存设置、聊天、记忆、提醒、任务记录、用量及服务配置。Codex 的独立登录目录也在这个用户根目录下。应用资源与用户数据分开，正常替换 `.app` 不会把用户数据一起覆盖。可用 `WHALE_PET_DATA_DIR` 指定其他目录，包括外盘；详见[配置文档](docs/CONFIGURATION.md#数据目录与更新)。
+macOS 默认用户目录为 `~/Library/Application Support/WhalePet`，Windows 为 `%LOCALAPPDATA%\WhalePet`，其中 `data/` 保存设置、聊天、记忆、提醒、任务记录、用量及服务配置。Codex 的独立登录目录也在这个用户根目录下。应用资源与用户数据分开，正常更新程序不会把用户数据一起覆盖。可用 `WHALE_PET_DATA_DIR` 指定其他目录，包括外盘；详见[配置文档](docs/CONFIGURATION.md#数据目录与更新)。
 
 API Key 使用本机权限受限的文件保存，不在设置读取接口或输入框中回显；这不是磁盘加密或系统钥匙串。不要公开用户数据目录。完整说明见[隐私文档](PRIVACY.md)。
 
 ## 从源码构建
+
+Windows 在 Windows 构建机上使用锁定的 .NET SDK 与 Python 3：
+
+```powershell
+python scripts/package-windows.py
+```
+
+脚本会核对锁定官方运行时、构建 self-contained WPF 程序、便携 ZIP 与中文安装器。GitHub Actions 的 `Windows build and isolated validation` 工作流提供完整 Windows 回归、离线运行、合成 WPF 渲染和安装包审计；需要人工发布时可先上传草稿，核对后再公开。重建特定已发布版本应先检出相应 Git tag。
 
 构建 `.app`、DMG 和 ZIP 需要 macOS 15+、Xcode Command Line Tools 与 Python 3。在项目根目录运行：
 
@@ -91,6 +103,7 @@ npm test
 每日 token 预算只暂停后续主动 AI；显式聊天、测试连接和手动网页任务仍可产生调用。它不是服务商账单的严格封顶，一次响应可能越过阈值，服务商未返回完整用量时统计也可能不完整。
 
 - [安装与首次启动](docs/INSTALL.zh-CN.md)
+- [Windows 安装与首次启动](docs/INSTALL.windows.zh-CN.md)
 - [AI 连接、隐私开关与数据目录](docs/CONFIGURATION.md)
 - [常见问题与排障](docs/TROUBLESHOOTING.md)
 - [隐私说明](PRIVACY.md) · [安全报告](SECURITY.md)
