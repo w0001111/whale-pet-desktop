@@ -130,10 +130,79 @@ def nuget_output_categories(text):
         'certificate-chain': r'\bNU30(?:18|28|42)\b|chain building issue',
         'crypto-api': r'CryptographicException|AppleCrypto|Crypt32',
         'sdk-resolution': r'\bNETSDK\d{4}\b|compatible .NET SDK|SDK.{0,80}not found|could not execute because',
+        'cli-arguments': r'unrecognized (?:command|option)|unexpected (?:argument|option)|unknown (?:option|command)|required argument|invalid (?:argument|option)',
+        'configuration': r'NuGet.Config.{0,100}(?:not found|does not exist|invalid)|(?:error|failed|unable).{0,100}(?:config|XML)|configuration file.{0,80}(?:not found|invalid|does not exist)',
+        'environment-path': r'ArgumentNullException|Value cannot be null.{0,80}path|NuGetEnvironment',
+        'io-missing': r'FileNotFoundException|DirectoryNotFoundException|could not find (?:file|a part of the path)|no such file',
         'access-denied': r'UnauthorizedAccess|access.{0,30}denied|SecurityException',
         'network': r'HttpRequestException|NameResolution|SocketException|connection.{0,40}(?:failed|refused)|SSL connection.{0,40}(?:failed|could not)|timed? out',
     }
     return sorted(name for name, pattern in patterns.items() if re.search(pattern, text, re.I))
+
+
+def decode_nuget_output(value):
+    if value is None:
+        return '', 'empty'
+    if isinstance(value, str):
+        return value, 'text'
+    if value.startswith((b'\xff\xfe', b'\xfe\xff')):
+        return value.decode('utf-16', errors='replace'), 'utf16-bom'
+    sample = value[:512]
+    if len(sample) >= 8 and sample[1::2].count(0) > len(sample[1::2]) // 2:
+        return value.decode('utf-16le', errors='replace'), 'utf16le-detected'
+    if len(sample) >= 8 and sample[0::2].count(0) > len(sample[0::2]) // 2:
+        return value.decode('utf-16be', errors='replace'), 'utf16be-detected'
+    return value.decode('utf-8-sig', errors='replace'), 'utf8'
+
+
+def sanitized_nuget_excerpt(text, env):
+    # Only trusted official-package tool output reaches this sanitizer. Scrub
+    # complete known values before truncation, so a long proxy/path cannot be
+    # partially exposed at the excerpt boundary.
+    values = {str(ROOT)}
+    for source in (env, os.environ):
+        for name, value in source.items():
+            if value and (name.upper() in {'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'TMPDIR',
+                                           'DOTNET_ROOT', 'DOTNET_CLI_HOME', 'NUGET_PACKAGES', 'WHALE_PET_DATA_DIR'}
+                          or 'PROXY' in name.upper()):
+                values.add(value)
+    for value in sorted(values, key=len, reverse=True):
+        if len(value) >= 3:
+            text = re.sub(re.escape(value), '[PATH_OR_PROXY]', text, flags=re.I)
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    text = re.sub(r'(?i)\b(https?://)[^\s/@]+@', r'\1[URL_USERINFO]@', text)
+    text = re.sub(r'(?i)(?:\\\\\?\\)?\b[A-Z]:[\\/][^\r\n\t\"\'<>]*', '[WINDOWS_PATH]', text)
+    text = re.sub(r'/(?:Users|Volumes|private|tmp|home)/[^\s\"\'<>]+', '[ABSOLUTE_PATH]', text)
+    text = re.sub(r'(?i)\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_.-]{12,})', '[CREDENTIAL_SHAPE]', text)
+    text = re.sub(r'(?i)(?:Bearer\s+[^\s\"\']+|(?:access_token|refresh_token|api_key|password|client_secret)\s*[:=]\s*[^\r\n]+)', '[CREDENTIAL_VALUE]', text)
+    text = ''.join(character if character.isprintable() or character in '\n\t' else '?' for character in text)
+    return '\n'.join(text.splitlines()[:32])[:6000]
+
+
+def emit_ci_nuget_diagnostic(record, text, env):
+    if ci_signature_environment({}) is None or record['verified']:
+        return
+    # Diagnostic log only, deliberately absent from every public JSON report and
+    # release asset. One JSON line also prevents Actions workflow-command syntax.
+    print('NUGET_CI_DIAGNOSTIC ' + json.dumps({'package': record['package'], 'profile': record['profile'],
+          'exitCode': record['exitCode'], 'excerpt': sanitized_nuget_excerpt(text, env)}, ensure_ascii=True), flush=True)
+
+
+SIGNATURE_SYSTEM_VARIABLES = ('ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'CommonProgramFiles',
+    'CommonProgramFiles(x86)', 'CommonProgramW6432', 'ProgramData', 'ALLUSERSPROFILE', 'SystemDrive')
+
+
+def signature_system_environment(env):
+    result = dict(env)
+    if os.name == 'nt':
+        # NuGet's IS_CORECLR Windows path resolver directly reads these names;
+        # missing PROGRAMFILES(X86)/PROGRAMFILES can cause Path.Combine(null,
+        # "NuGet") before package validation. These are machine paths only.
+        original = {name.upper(): value for name, value in os.environ.items()}
+        for name in SIGNATURE_SYSTEM_VARIABLES:
+            if original.get(name.upper()):
+                result[name] = original[name.upper()]
+    return result
 
 
 def probe_nuget_signature(dotnet, archive, package, version, env, profile='isolated'):
@@ -144,28 +213,35 @@ def probe_nuget_signature(dotnet, archive, package, version, env, profile='isola
               'exitCode': None, 'nugetCodes': [], 'outputCategories': []}
     # Deterministic language improves category diagnostics without inheriting any
     # developer account environment. Online revocation remains the default.
-    command_env = {**env, 'DOTNET_CLI_UI_LANGUAGE': 'en-US', 'NUGET_CERT_REVOCATION_MODE': 'online',
-                   'DOTNET_SKIP_FIRST_TIME_EXPERIENCE': '1'}
+    command_env = signature_system_environment({**env, 'DOTNET_CLI_UI_LANGUAGE': 'en-US',
+                   'NUGET_CERT_REVOCATION_MODE': 'online', 'DOTNET_SKIP_FIRST_TIME_EXPERIENCE': '1'})
     record['revocationMode'] = 'online'
+    record['systemEnvironmentKeys'] = [name for name in SIGNATURE_SYSTEM_VARIABLES if command_env.get(name)]
     text = ''
+    stdout, stderr = b'', b''
     try:
         result = subprocess.run([str(dotnet), 'nuget', 'verify', str(archive), '--all', '--verbosity', 'detailed',
                                  '--configfile', str(ROOT / 'NuGet.Config')],
                                 cwd=ROOT, env=command_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding='utf-8', errors='replace', timeout=180,
+                                timeout=180,
                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         record.update(commandStarted=True, exitCode=result.returncode, verified=result.returncode == 0)
-        text = result.stdout + '\n' + result.stderr
+        stdout, stderr = result.stdout, result.stderr
     except subprocess.TimeoutExpired as error:
         record.update(commandStarted=True, timedOut=True)
-        def decoded(value):
-            return value.decode('utf-8', errors='replace') if isinstance(value, bytes) else (value or '')
-        text = decoded(error.stdout) + '\n' + decoded(error.stderr)
+        stdout, stderr = error.stdout or b'', error.stderr or b''
     except OSError:
         record['outputCategories'] = ['verifier-start-failed']
+    out_text, out_encoding = decode_nuget_output(stdout)
+    err_text, err_encoding = decode_nuget_output(stderr)
+    text = out_text + '\n' + err_text
+    record.update(stdoutBytes=len(stdout), stderrBytes=len(stderr),
+                  stdoutEncoding=out_encoding, stderrEncoding=err_encoding,
+                  outputNulCount=text.count('\0'), outputReplacementCount=text.count('\ufffd'))
     record['elapsedMs'] = round((time.monotonic() - started) * 1000)
     record['nugetCodes'] = sorted(set(re.findall(r'\bNU\d{4}\b', text)))
     record['outputCategories'] = sorted(set(record['outputCategories']) | set(nuget_output_categories(text)))
+    emit_ci_nuget_diagnostic(record, text, command_env)
     return record
 
 
