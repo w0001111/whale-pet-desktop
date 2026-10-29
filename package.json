@@ -1,0 +1,17 @@
+{
+  "name": "whale-pet-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local-first macOS whale companion with optional Codex or compatible API chat",
+  "license": "MIT",
+  "type": "module",
+  "engines": {"node": ">=24"},
+  "scripts": {
+    "test": "node --test *.test.mjs",
+    "test:native": "bash scripts/test-native.sh",
+    "audit:self-test": "python3 scripts/audit-release.py --self-test",
+    "audit:source": "python3 scripts/audit-release.py --source .",
+    "package:arm64": "python3 scripts/package-macos.py --arch arm64",
+    "package:intel": "python3 scripts/package-macos.py --arch x86_64"
+  }
+}

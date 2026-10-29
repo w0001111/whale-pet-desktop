@@ -1,0 +1,241 @@
+{
+  "version": 1,
+  "sheets": [
+    {
+      "id": "movement",
+      "file": "movement-v2.png",
+      "columns": 3,
+      "rows": 3,
+      "regions": [
+        [
+          56,
+          82,
+          350,
+          350
+        ],
+        [
+          466,
+          81,
+          350,
+          350
+        ],
+        [
+          864,
+          81,
+          350,
+          350
+        ],
+        [
+          69,
+          470,
+          350,
+          350
+        ],
+        [
+          481,
+          469,
+          350,
+          350
+        ],
+        [
+          891,
+          472,
+          350,
+          350
+        ],
+        [
+          60,
+          841,
+          350,
+          350
+        ],
+        [
+          472,
+          841,
+          350,
+          350
+        ],
+        [
+          887,
+          842,
+          350,
+          350
+        ]
+      ]
+    },
+    {
+      "id": "eating",
+      "file": "eating-v2.png",
+      "columns": 2,
+      "rows": 2,
+      "regions": [
+        [
+          75,
+          100,
+          550,
+          550
+        ],
+        [
+          640,
+          100,
+          550,
+          550
+        ],
+        [
+          73,
+          675,
+          550,
+          550
+        ],
+        [
+          642,
+          675,
+          550,
+          550
+        ]
+      ]
+    },
+    {
+      "id": "cheer",
+      "file": "cheer.png",
+      "columns": 2,
+      "rows": 2
+    },
+    {
+      "id": "gaming",
+      "file": "gaming.png",
+      "columns": 2,
+      "rows": 2
+    },
+    {
+      "id": "music",
+      "file": "music.png",
+      "columns": 2,
+      "rows": 2,
+      "regions": [
+        [
+          26,
+          7,
+          605,
+          605
+        ],
+        [
+          648,
+          8,
+          605,
+          605
+        ],
+        [
+          29,
+          630,
+          605,
+          605
+        ],
+        [
+          619,
+          630,
+          605,
+          605
+        ]
+      ]
+    }
+  ],
+  "clips": [
+    {
+      "id": "standUp",
+      "sheet": "movement",
+      "frames": [
+        0,
+        1,
+        2
+      ],
+      "fps": 4,
+      "loop": false
+    },
+    {
+      "id": "stand",
+      "sheet": "movement",
+      "frames": [
+        2
+      ],
+      "fps": 1,
+      "loop": true
+    },
+    {
+      "id": "walk",
+      "sheet": "movement",
+      "frames": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "fps": 7,
+      "loop": true
+    },
+    {
+      "id": "eat",
+      "sheet": "eating",
+      "frames": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "fps": 4,
+      "loop": true
+    },
+    {
+      "id": "sitDown",
+      "sheet": "movement",
+      "frames": [
+        2,
+        1,
+        0
+      ],
+      "fps": 4,
+      "loop": false
+    },
+    {
+      "id": "cheer",
+      "displayName": "拉拉队应援",
+      "sheet": "cheer",
+      "frames": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "fps": 3.5,
+      "loop": true
+    },
+    {
+      "id": "gaming",
+      "displayName": "打游戏",
+      "sheet": "gaming",
+      "frames": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "fps": 3.5,
+      "loop": true
+    },
+    {
+      "id": "music",
+      "displayName": "听歌",
+      "sheet": "music",
+      "frames": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "fps": 3.5,
+      "loop": true
+    }
+  ]
+}

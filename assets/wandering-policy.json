@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "speed": 28,
+  "minPause": 4,
+  "maxPause": 12,
+  "margin": 10
+}

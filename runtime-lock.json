@@ -1,0 +1,22 @@
+{
+  "nodeVersion": "24.22.2",
+  "codexVersion": "0.164.0",
+  "architectures": {
+    "arm64": {
+      "nodeURL": "https://nodejs.org/dist/v24.22.2/node-v24.22.2-darwin-arm64.tar.gz",
+      "nodeSHA256": "aa9549349e47dffaa42dcf95d6e06ade8c4bdafc980979883b88767670df385a",
+      "codexURL": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0-darwin-arm64.tgz",
+      "codexIntegrity": "sha512-pDizgOUAtq3/k3AbUFHbaU19WpYKCja+oFpNSTLKrDQj4lTUNSDuTPJip4uQVn2/1EipQdpQrGMOQBVuI1znAA=="
+    },
+    "x86_64": {
+      "nodeURL": "https://nodejs.org/dist/v24.22.2/node-v24.22.2-darwin-x64.tar.gz",
+      "nodeSHA256": "d5e336d588c45be0c37dbd52cc29895593009ca4997a77a1fd02815131ed0e52",
+      "codexURL": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0-darwin-x64.tgz",
+      "codexIntegrity": "sha512-lIe+udnguPGzBezkgbkj2Eaz0YqOhNXT7jja136Fj0sXfI+UKNS2icmaK14GcoRAgeVEpDTtC1ftamWBPmD1zg=="
+    }
+  },
+  "codexLicenseURL": "https://raw.githubusercontent.com/openai/codex/rust-v0.164.0/LICENSE",
+  "codexLicenseSHA256": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc",
+  "codexNoticeURL": "https://raw.githubusercontent.com/openai/codex/rust-v0.164.0/NOTICE",
+  "codexNoticeSHA256": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915"
+}
