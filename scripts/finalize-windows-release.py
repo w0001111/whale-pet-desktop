@@ -9,12 +9,14 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / 'dist/windows'
 VALIDATION = ROOT / 'build/windows-validation'
+SOURCE_DIAGNOSTIC = VALIDATION / 'source-audit-windows.json'
 VERSION = '0.2.0-windows.1'
 REPORTS = (
     ('smoke-windows.json', 'validation-smoke-windows.json'),
@@ -63,6 +65,9 @@ def load_json(file):
 
 
 def auditor():
+    # Importing a scanner containing deliberately bad synthetic fixtures must
+    # not create compiled fixture bytes in the source directory being audited.
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location('whale_release_auditor', ROOT / 'scripts/audit-release.py')
     check(spec is not None and spec.loader is not None, 'SOURCE_AUDITOR_UNAVAILABLE')
     module = importlib.util.module_from_spec(spec)
@@ -74,6 +79,103 @@ def findings_summary(audit):
     return {'files': audit.files, 'archives': audit.archives,
             'findingsCount': len(audit.findings),
             'categories': dict(sorted(Counter(item[2] for item in audit.findings).items()))}
+
+
+def safe_findings(audit):
+    result = []
+    for name, line, category in sorted(audit.findings):
+        name = ''.join(value if value.isprintable() else '?' for value in str(name)).replace('\\', '/')[:1000]
+        if (name.startswith('/') or '!//' in name or re.search(r'(?:^|!/)[A-Za-z]:/', name)
+                or '..' in PurePosixPath(name).parts):
+            name = 'unsafe-entry/' + hashlib.sha256(name.encode('utf-8')).hexdigest()[:16]
+        result.append({'path': name, 'line': max(1, int(line)), 'category': str(category)})
+    return result
+
+
+def source_diagnostic(report, stage=None, audit=None, error=None):
+    if stage is not None and audit is not None:
+        records = safe_findings(audit)
+        report[stage] = {**findings_summary(audit), 'findings': records}
+        print(json.dumps({'sourceAuditStage': stage, 'findingsCount': len(records),
+                          'files': audit.files, 'archives': audit.archives}), flush=True)
+        for record in records:
+            # Deliberately report only a safe relative path, line and category.
+            # Never print matching bytes, snippets, user directories or tokens.
+            print(json.dumps({'sourceAuditFinding': record}), flush=True)
+    if error is not None:
+        report['error'] = {'code': error}
+    SOURCE_DIAGNOSTIC.parent.mkdir(parents=True, exist_ok=True)
+    SOURCE_DIAGNOSTIC.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+
+
+def git_result(root, *args, binary=False):
+    return subprocess.run(['git', *args], cwd=root, check=True, capture_output=True,
+                          text=not binary, encoding=None if binary else 'utf-8')
+
+
+def verify_git_root(root):
+    check(Path(git_result(root, 'rev-parse', '--show-toplevel').stdout.strip()).resolve() == root.resolve(),
+          'SOURCE_REPOSITORY_ROOT_MISMATCH')
+
+
+def git_worktree_clean(root):
+    verify_git_root(root)
+    return not git_result(root, 'status', '--porcelain', '-z', '--untracked-files=normal', binary=True).stdout
+
+
+def is_link(file):
+    return file.is_symlink() or getattr(file, 'is_junction', lambda: False)()
+
+
+def tracked_source_audit(scanner, root=ROOT):
+    """Audit every indexed source byte, never generated/ignored build output.
+
+    This is not a pattern exclusion: tracked caches or credentials are still
+    inspected/rejected, and a complete committed source ZIP is audited later.
+    """
+    verify_git_root(root)
+    audit = scanner.Audit()
+    entries = git_result(root, 'ls-files', '--stage', '-z', binary=True).stdout.split(b'\0')
+    seen = set()
+    for raw in entries:
+        if not raw:
+            continue
+        try:
+            metadata, encoded = raw.split(b'\t', 1)
+            mode, _object_id, stage = metadata.decode('ascii').split()
+            name = relative_name(encoded.decode('utf-8'))
+        except (ValueError, UnicodeError, FinalizationFailure):
+            audit.add('tracked-source/invalid-entry-' + hashlib.sha256(raw).hexdigest()[:16], 1, 'invalid_tracked_source_path')
+            continue
+        label = 'tracked-source/' + name
+        if stage != '0' or name in seen:
+            audit.add(label, 1, 'unmerged_or_duplicate_tracked_source')
+            continue
+        seen.add(name)
+        if audit.forbidden(label, directory=mode == '160000', packaged=True):
+            continue
+        if mode not in {'100644', '100755'}:
+            audit.add(label, 1, 'tracked_source_link_or_submodule')
+            continue
+        file = root / name
+        parents = [parent for parent in file.parents if parent != root and root in parent.parents]
+        if is_link(file) or any(is_link(parent) for parent in parents):
+            audit.add(label, 1, 'tracked_source_symlink_or_junction')
+            continue
+        try:
+            info = file.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                audit.add(label, 1, 'tracked_source_not_single_regular_file')
+            elif info.st_size > scanner.MAX_FILE_BYTES:
+                audit.add(label, 1, 'file_size_limit_uninspected')
+            elif file.suffix.lower() == '.dmg':
+                audit.scan_dmg(file, label)
+            else:
+                audit.scan_bytes(file.read_bytes(), label)
+        except OSError:
+            audit.add(label, 1, 'tracked_source_unreadable')
+    check(bool(seen), 'SOURCE_INDEX_EMPTY')
+    return audit, len(seen)
 
 
 def verify_manifest(manifest_file, version):
@@ -162,8 +264,7 @@ def gates(reports):
 def git_clean_archive(destination, version):
     def git(*args):
         return subprocess.run(['git', *args], cwd=ROOT, check=True, capture_output=True, text=True, encoding='utf-8')
-    check(Path(git('rev-parse', '--show-toplevel').stdout.strip()).resolve() == ROOT, 'SOURCE_REPOSITORY_ROOT_MISMATCH')
-    check(not git('status', '--porcelain', '--untracked-files=normal').stdout.strip(), 'SOURCE_WORKTREE_NOT_CLEAN')
+    check(git_worktree_clean(ROOT), 'SOURCE_WORKTREE_NOT_CLEAN')
     git('archive', '--format=zip', '--prefix=whale-pet-desktop-' + version + '/', '--output=' + str(destination), 'HEAD')
 
 
@@ -206,6 +307,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--version', default=VERSION)
     args = parser.parse_args()
+    diagnostic = {'schemaVersion': 1, 'pass': False, 'sourceScope': 'git-tracked-files-and-clean-head-archive',
+                  'gitClean': False}
     try:
         check(os.name == 'nt', 'WINDOWS_REQUIRED')
         check(re.fullmatch(r'\d+\.\d+\.\d+(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?', args.version), 'INVALID_VERSION')
@@ -215,22 +318,31 @@ def main():
         manifest_hash = sha(regular(manifest_file))
         manifest = verify_manifest(manifest_file, args.version)
         scanner = auditor()
-        source_audit = scanner.Audit()
-        source_audit.scan_tree(ROOT, 'source', source=True)
+        source_audit, tracked_count = tracked_source_audit(scanner)
+        diagnostic['trackedFiles'] = tracked_count
+        diagnostic['gitClean'] = git_worktree_clean(ROOT)
+        source_diagnostic(diagnostic, 'project', source_audit)
         check(not source_audit.findings, 'PROJECT_SOURCE_AUDIT_FAILED')
+        check(diagnostic['gitClean'], 'SOURCE_WORKTREE_NOT_CLEAN')
         source_zip = DIST / f'Whale-Pet-{args.version}-source.zip'
         check(not source_zip.is_symlink(), 'SOURCE_ARCHIVE_SYMLINK')
         git_clean_archive(source_zip, args.version)
         archive_audit = scanner.Audit()
         archive_audit.scan_target(source_zip, 'source-archive')
+        source_diagnostic(diagnostic, 'archive', archive_audit)
         check(not archive_audit.findings, 'SOURCE_ARCHIVE_AUDIT_FAILED')
-        source_summary = {'pass': True, 'project': findings_summary(source_audit),
+        diagnostic['pass'] = True
+        source_diagnostic(diagnostic)
+        source_summary = {'pass': True, 'sourceScope': diagnostic['sourceScope'], 'trackedFiles': tracked_count,
+                          'gitClean': True, 'project': findings_summary(source_audit),
                           'archive': findings_summary(archive_audit),
                           'archiveFile': source_zip.name, 'sha256': sha(source_zip)}
         for (source, destination), value in zip(REPORTS, reports):
             text = regular(VALIDATION / source).read_bytes()
             report_audit = scanner.Audit()
             report_audit.scan_bytes(text, destination)
+            if report_audit.findings:
+                source_diagnostic(diagnostic, 'publicReport', report_audit)
             check(not report_audit.findings, 'PUBLIC_REPORT_AUDIT_FAILED')
             shutil.copyfile(VALIDATION / source, DIST / destination)
         (DIST / 'validation-source-windows.json').write_text(json.dumps(source_summary, indent=2) + '\n', encoding='utf-8')
@@ -250,6 +362,8 @@ def main():
         return 0
     except Exception as error:
         code = str(error) if isinstance(error, FinalizationFailure) else 'WINDOWS_FINALIZATION_FAILED'
+        diagnostic['pass'] = False
+        source_diagnostic(diagnostic, error=code)
         print(json.dumps({'pass': False, 'error': {'code': code}}))
         return 1
 

@@ -19,6 +19,7 @@ jobs:
       DOTNET_CLI_HOME: ${{ github.workspace }}/.cache/dotnet-home
       NUGET_PACKAGES: ${{ github.workspace }}/.cache/nuget
       PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -28,6 +29,8 @@ jobs:
         uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: '10.0.403'
+      - name: Audit source privacy before building
+        run: python scripts/audit-release.py --source .
       - name: Verify official runtime archives
         run: python scripts/fetch-windows-runtime.py --include-installer
       - name: Restore pinned Microsoft runtime packs
